@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from ziran.domain.entities.streaming import AgentResponseChunk
-from ziran.infrastructure.adapters.protocols import BaseProtocolHandler, ProtocolError
+from ziran.infrastructure.adapters.protocols import (
+    BaseProtocolHandler,
+    ProtocolError,
+    ProtocolResponse,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -44,7 +48,7 @@ class OpenAIProtocolHandler(BaseProtocolHandler):
         self._max_tokens = max_tokens
         self._conversation: list[dict[str, str]] = []
 
-    async def send(self, message: str, **kwargs: Any) -> dict[str, Any]:
+    async def send(self, message: str, **kwargs: Any) -> ProtocolResponse:
         """Send a message via the chat completions endpoint.
 
         Maintains conversation history for multi-turn interactions.
@@ -72,7 +76,9 @@ class OpenAIProtocolHandler(BaseProtocolHandler):
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             msg = f"OpenAI request failed with status {exc.response.status_code}"
-            raise ProtocolError(msg, status_code=exc.response.status_code) from exc
+            raise ProtocolError(
+                msg, status_code=exc.response.status_code, headers=dict(exc.response.headers)
+            ) from exc
         except httpx.HTTPError as exc:
             msg = f"OpenAI request failed: {exc}"
             raise ProtocolError(msg) from exc

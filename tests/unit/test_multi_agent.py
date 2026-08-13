@@ -6,11 +6,14 @@ knowledge graph extensions, and multi-agent scanner.
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+if TYPE_CHECKING:
+    from ziran.application.attacks.library import AttackLibrary
 from ziran.domain.entities.multi_agent import (
     AgentEdge,
     AgentNode,
@@ -229,18 +232,15 @@ class TestKnowledgeGraphMultiAgent:
 class TestMultiAgentAttackVectors:
     """Tests that multi-agent YAML vectors load correctly."""
 
-    def test_vectors_load(self) -> None:
-        from ziran.application.attacks.library import AttackLibrary
+    def test_vectors_load(self, shared_attack_library: AttackLibrary) -> None:
         from ziran.domain.entities.attack import AttackCategory
 
-        library = AttackLibrary()
+        library = shared_attack_library
         # Should have multi_agent category
         assert AttackCategory.MULTI_AGENT in library.categories
 
-    def test_vector_ids_unique(self) -> None:
-        from ziran.application.attacks.library import AttackLibrary
-
-        library = AttackLibrary()
+    def test_vector_ids_unique(self, shared_attack_library: AttackLibrary) -> None:
+        library = shared_attack_library
         ids = [v.id for v in library.vectors]
         assert len(ids) == len(set(ids)), "Duplicate vector IDs found"
 
@@ -711,3 +711,42 @@ class TestMultiAgentScanner:
         # Should have received progress events
         assert len(events) >= 2  # at least CAMPAIGN_START + PHASE_START
         assert result.topology is not None
+
+    @pytest.mark.asyncio
+    async def test_individual_scans_run_concurrently(self) -> None:
+        """Individual agent scans should run via asyncio.gather, not sequentially."""
+        from ziran.application.multi_agent.scanner import MultiAgentScanner
+
+        execution_order: list[str] = []
+        call_count = 0
+
+        async def _slow_run_campaign(**_: Any) -> CampaignResult:
+            nonlocal call_count
+            agent_id = f"agent_{call_count}"
+            call_count += 1
+            execution_order.append(f"start:{agent_id}")
+            await asyncio.sleep(0.05)
+            execution_order.append(f"end:{agent_id}")
+            return _make_campaign_result(total_vulnerabilities=1)
+
+        adapters: dict[str, Any] = {f"agent_{i}": self._make_mock_adapter() for i in range(3)}
+        scanner = MultiAgentScanner(adapters=adapters)
+        scanner._topology = _make_topology()
+
+        with patch(
+            "ziran.application.multi_agent.scanner.AgentScanner.run_campaign",
+            side_effect=_slow_run_campaign,
+        ):
+            result = await scanner.run_multi_agent_campaign(
+                scan_individual=True,
+                scan_cross_agent=False,
+            )
+
+        # All 3 agents should have results
+        assert len(result.individual_results) == 3
+        # With asyncio.gather, all starts should happen before any end
+        starts = [i for i, e in enumerate(execution_order) if e.startswith("start")]
+        ends = [i for i, e in enumerate(execution_order) if e.startswith("end")]
+        assert len(starts) == 3
+        # All starts should come before the first end (concurrent execution)
+        assert max(starts) < min(ends)

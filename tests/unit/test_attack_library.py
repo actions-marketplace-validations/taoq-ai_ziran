@@ -15,9 +15,9 @@ class TestAttackLibrary:
     """Tests for AttackLibrary YAML loading and filtering."""
 
     @pytest.fixture
-    def library(self) -> AttackLibrary:
-        """Library loaded with built-in vectors."""
-        return AttackLibrary()
+    def library(self, shared_attack_library: AttackLibrary) -> AttackLibrary:
+        """Library loaded with built-in vectors (session-cached)."""
+        return shared_attack_library
 
     def test_loads_builtin_vectors(self, library: AttackLibrary) -> None:
         assert library.vector_count > 0
@@ -148,3 +148,120 @@ vectors:
             load_builtin=False,
         )
         assert lib.vector_count == 0
+
+    def test_indirect_injection_has_50_plus_vectors(self, library: AttackLibrary) -> None:
+        """GAP-02: indirect_injection category should have 50+ vectors."""
+        ii_attacks = library.get_attacks_by_category(AttackCategory.INDIRECT_INJECTION)
+        assert len(ii_attacks) >= 50, (
+            f"Expected 50+ indirect injection vectors, got {len(ii_attacks)}"
+        )
+
+    def test_no_duplicate_ids_across_files(self, library: AttackLibrary) -> None:
+        """All vector IDs must be unique across all YAML files."""
+        seen: dict[str, str] = {}
+        for vector in library.vectors:
+            assert vector.id not in seen, (
+                f"Duplicate vector ID '{vector.id}' (first in category "
+                f"'{seen[vector.id]}', duplicate in '{vector.category}')"
+            )
+            seen[vector.id] = str(vector.category)
+
+    def test_agentharm_multistep_coverage(self, library: AttackLibrary) -> None:
+        """Issue #131: AgentHarm expansion should provide 100+ multi-step vectors."""
+        harm_vectors = [v for v in library.vectors if getattr(v, "harm_category", None) is not None]
+        assert len(harm_vectors) >= 100, (
+            f"Expected 100+ harm-category vectors, got {len(harm_vectors)}"
+        )
+
+    def test_agentharm_all_categories_covered(self, library: AttackLibrary) -> None:
+        """Issue #131: All 11 AgentHarm harm categories should have vectors."""
+        from ziran.domain.entities.attack import HarmCategory
+
+        harm_vectors = [v for v in library.vectors if getattr(v, "harm_category", None) is not None]
+        covered = {v.harm_category for v in harm_vectors}
+        expected = set(HarmCategory)
+        missing = expected - covered
+        assert not missing, f"Missing harm categories: {missing}"
+
+    def test_agentharm_tactic_diversity(self, library: AttackLibrary) -> None:
+        """Issue #131: Expanded vectors should use diverse multi-turn tactics."""
+        harm_vectors = [v for v in library.vectors if getattr(v, "harm_category", None) is not None]
+        tactics = {v.tactic for v in harm_vectors if v.tactic}
+        assert len(tactics) >= 5, (
+            f"Expected 5+ distinct tactics in harm vectors, got {len(tactics)}: {tactics}"
+        )
+
+    def test_mcp_vectors_loaded(self, library: AttackLibrary) -> None:
+        """GAP-03: MCP tool poisoning vectors should be loaded."""
+        mcp_attacks = [v for v in library.vectors if "mcp" in v.protocol_filter]
+        assert len(mcp_attacks) >= 10, f"Expected 10+ MCP vectors, got {len(mcp_attacks)}"
+
+    def test_mcptox_expanded_coverage(self, library: AttackLibrary) -> None:
+        """Issue #146: MCPTox expansion should provide 100+ MCP vectors."""
+        mcp_attacks = library.get_attacks_by_tag("mcp")
+        assert len(mcp_attacks) >= 100, (
+            f"Expected 100+ MCP vectors for MCPTox coverage, got {len(mcp_attacks)}"
+        )
+
+    def test_mcptox_category_diversity(self, library: AttackLibrary) -> None:
+        """Issue #146: MCPTox vectors should span multiple attack categories."""
+        mcptox = library.get_attacks_by_tag("mcptox")
+        categories = {v.category for v in mcptox}
+        assert len(categories) >= 3, (
+            f"Expected MCPTox vectors in 3+ categories, got {len(categories)}: {categories}"
+        )
+
+    def test_mcp_vectors_have_protocol_filter(self, library: AttackLibrary) -> None:
+        """All MCP vectors should have protocol_filter=['mcp']."""
+        mcp_attacks = [v for v in library.vectors if v.id.startswith("mcp_")]
+        assert len(mcp_attacks) > 0
+        for v in mcp_attacks:
+            assert "mcp" in v.protocol_filter, (
+                f"MCP vector '{v.id}' missing protocol_filter=['mcp']"
+            )
+
+
+class TestLoadErrorTracking:
+    """Tests for load error tracking (#126)."""
+
+    def test_load_errors_empty_for_valid_files(self) -> None:
+        """Built-in library should have zero load errors."""
+        lib = AttackLibrary()
+        assert lib.load_error_count == 0
+        assert lib.load_errors == []
+
+    def test_load_errors_tracked_for_invalid_vector(self, tmp_path: Path) -> None:
+        """One valid + one invalid vector → error count 1, vector count 1."""
+        yaml_content = """
+vectors:
+  - id: good_vector
+    name: Good Vector
+    category: prompt_injection
+    target_phase: reconnaissance
+    severity: low
+    description: Valid vector
+    prompts:
+      - template: "Test"
+        success_indicators: ["ok"]
+  - id: bad_vector
+    name: Bad Vector
+    category: INVALID_CATEGORY
+    target_phase: reconnaissance
+    severity: low
+    description: Invalid category
+    prompts:
+      - template: "Test"
+        success_indicators: ["ok"]
+"""
+        (tmp_path / "mixed.yaml").write_text(yaml_content)
+        lib = AttackLibrary(custom_dirs=[tmp_path], load_builtin=False)
+        assert lib.vector_count == 1
+        assert lib.load_error_count == 1
+        assert lib.load_errors[0][0] == "bad_vector"
+
+    def test_load_errors_for_bad_yaml_file(self, tmp_path: Path) -> None:
+        """Malformed YAML should be tracked as a load error."""
+        (tmp_path / "broken.yaml").write_text("{{invalid yaml: [")
+        lib = AttackLibrary(custom_dirs=[tmp_path], load_builtin=False)
+        assert lib.vector_count == 0
+        assert lib.load_error_count == 1

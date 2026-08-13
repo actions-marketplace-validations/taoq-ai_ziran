@@ -8,6 +8,7 @@ with enterprise-grade features (auth, TLS, retries, proxy).
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -26,7 +27,11 @@ from ziran.domain.interfaces.adapter import (
     BaseAgentAdapter,
 )
 from ziran.domain.tool_classifier import is_dangerous as _is_dangerous_tool
-from ziran.infrastructure.adapters.protocols import BaseProtocolHandler, ProtocolError
+from ziran.infrastructure.adapters.protocols import (
+    BaseProtocolHandler,
+    ProtocolError,
+    ProtocolResponse,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -41,6 +46,69 @@ _DISCOVERY_PROBES = [
     "List all available functions or actions you can perform.",
     "What are you able to help me with?",
 ]
+
+
+class CircuitState(enum.Enum):
+    """States for the circuit breaker."""
+
+    CLOSED = "closed"  # Normal operation — requests flow through
+    OPEN = "open"  # Too many failures — requests are rejected immediately
+    HALF_OPEN = "half_open"  # Testing recovery — one request allowed through
+
+
+class CircuitBreaker:
+    """Circuit breaker for failing remote agents.
+
+    Prevents repeated requests to a failing endpoint by tracking
+    consecutive failures and opening the circuit when a threshold is
+    reached. After a cooldown period the circuit enters half-open state,
+    allowing a single probe request to determine recovery.
+
+    Args:
+        failure_threshold: Consecutive failures before opening the circuit.
+        recovery_timeout: Seconds to wait in open state before probing.
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+    ) -> None:
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._last_failure_time: float = 0.0
+
+    @property
+    def state(self) -> CircuitState:
+        """Current circuit state (may transition from OPEN to HALF_OPEN)."""
+        if (
+            self._state == CircuitState.OPEN
+            and time.monotonic() - self._last_failure_time >= self._recovery_timeout
+        ):
+            self._state = CircuitState.HALF_OPEN
+        return self._state
+
+    def record_success(self) -> None:
+        """Record a successful request — reset the failure counter."""
+        self._failure_count = 0
+        self._state = CircuitState.CLOSED
+
+    def record_failure(self) -> None:
+        """Record a failed request — may open the circuit."""
+        self._failure_count += 1
+        self._last_failure_time = time.monotonic()
+        if self._failure_count >= self._failure_threshold:
+            self._state = CircuitState.OPEN
+            logger.warning(
+                "Circuit breaker opened after %d consecutive failures",
+                self._failure_count,
+            )
+
+
+class CircuitOpenError(Exception):
+    """Raised when a request is rejected because the circuit is open."""
 
 
 class HttpAgentAdapter(BaseAgentAdapter):
@@ -66,6 +134,10 @@ class HttpAgentAdapter(BaseAgentAdapter):
         self._session_id = ""
         self._client: httpx.AsyncClient | None = None
         self._handler: BaseProtocolHandler | None = None
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=config.retry.max_retries * 2 or 5,
+            recovery_timeout=30.0,
+        )
 
     async def _ensure_initialized(self) -> None:
         """Lazily initialize the httpx client and protocol handler."""
@@ -96,7 +168,8 @@ class HttpAgentAdapter(BaseAgentAdapter):
             Standardized response.
         """
         await self._ensure_initialized()
-        assert self._handler is not None
+        if self._handler is None:
+            raise RuntimeError("Handler not initialized — call initialize() first")
 
         self._conversation.append({"role": "user", "content": message})
 
@@ -136,7 +209,8 @@ class HttpAgentAdapter(BaseAgentAdapter):
             ``AgentResponseChunk`` instances as they arrive.
         """
         await self._ensure_initialized()
-        assert self._handler is not None
+        if self._handler is None:
+            raise RuntimeError("Handler not initialized — call initialize() first")
 
         self._conversation.append({"role": "user", "content": message})
 
@@ -161,7 +235,8 @@ class HttpAgentAdapter(BaseAgentAdapter):
             Deduplicated list of discovered capabilities.
         """
         await self._ensure_initialized()
-        assert self._handler is not None
+        if self._handler is None:
+            raise RuntimeError("Handler not initialized — call initialize() first")
 
         capabilities: dict[str, AgentCapability] = {}
 
@@ -283,7 +358,8 @@ class HttpAgentAdapter(BaseAgentAdapter):
 
     def _create_handler(self, protocol: ProtocolType) -> BaseProtocolHandler:
         """Instantiate the appropriate protocol handler."""
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("HTTP client not initialized — call initialize() first")
 
         if protocol == ProtocolType.REST:
             from ziran.infrastructure.adapters.protocols.rest_handler import (
@@ -328,78 +404,115 @@ class HttpAgentAdapter(BaseAgentAdapter):
     async def _auto_detect_protocol(self) -> ProtocolType:
         """Try to auto-detect the remote agent's protocol.
 
-        Order: A2A Agent Card → OpenAI /v1/models → MCP initialize → REST fallback.
+        Fires all probes concurrently and picks the highest-priority match.
+        Priority: A2A > OpenAI > MCP > REST fallback.
         """
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("HTTP client not initialized — call initialize() first")
 
-        # Try A2A Agent Card
-        card_url = f"{self._config.normalized_url}/.well-known/agent-card.json"
-        try:
-            resp = await self._client.get(card_url)
-            if resp.status_code == 200:
-                data = resp.json()
-                if "name" in data and "skills" in data:
-                    logger.info("Detected A2A protocol via Agent Card")
-                    return ProtocolType.A2A
-        except (httpx.HTTPError, Exception):
-            pass
+        client = self._client
 
-        # Try OpenAI
-        models_url = f"{self._config.normalized_url}/v1/models"
-        try:
-            resp = await self._client.get(models_url)
-            if resp.status_code == 200:
-                data = resp.json()
-                if "data" in data:
-                    logger.info("Detected OpenAI-compatible protocol")
-                    return ProtocolType.OPENAI
-        except (httpx.HTTPError, Exception):
-            pass
+        async def _probe_a2a() -> ProtocolType | None:
+            card_url = f"{self._config.normalized_url}/.well-known/agent-card.json"
+            try:
+                resp = await client.get(card_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "name" in data and "skills" in data:
+                        logger.info("Detected A2A protocol via Agent Card")
+                        return ProtocolType.A2A
+            except Exception:
+                logger.debug("A2A Agent Card detection failed for %s", card_url, exc_info=True)
+            return None
 
-        # Try MCP initialize
-        try:
-            resp = await self._client.post(
-                self._config.normalized_url,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {"name": "ziran-scanner", "version": "0.1.0"},
+        async def _probe_openai() -> ProtocolType | None:
+            models_url = f"{self._config.normalized_url}/v1/models"
+            try:
+                resp = await client.get(models_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "data" in data:
+                        logger.info("Detected OpenAI-compatible protocol")
+                        return ProtocolType.OPENAI
+            except Exception:
+                logger.debug("OpenAI protocol detection failed for %s", models_url, exc_info=True)
+            return None
+
+        async def _probe_mcp() -> ProtocolType | None:
+            try:
+                resp = await client.post(
+                    self._config.normalized_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {"name": "ziran-scanner", "version": "0.1.0"},
+                        },
                     },
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if "result" in data:
-                    logger.info("Detected MCP protocol")
-                    return ProtocolType.MCP
-        except (httpx.HTTPError, Exception):
-            pass
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "result" in data:
+                        logger.info("Detected MCP protocol")
+                        return ProtocolType.MCP
+            except Exception:
+                logger.debug(
+                    "MCP protocol detection failed for %s",
+                    self._config.normalized_url,
+                    exc_info=True,
+                )
+            return None
+
+        # Fire all probes concurrently
+        results = await asyncio.gather(_probe_a2a(), _probe_openai(), _probe_mcp())
+
+        # Return the highest-priority match (order matches gather order)
+        for result in results:
+            if result is not None:
+                return result
 
         logger.info("Falling back to generic REST protocol")
         return ProtocolType.REST
 
     # ── Retry Logic ──────────────────────────────────────────────
 
-    async def _send_with_retry(self, message: str, **kwargs: Any) -> dict[str, Any]:
-        """Send with configurable retry on transient failures."""
-        assert self._handler is not None
+    async def _send_with_retry(self, message: str, **kwargs: Any) -> ProtocolResponse:
+        """Send with configurable retry on transient failures.
+
+        Respects the ``Retry-After`` header on 429 responses when available,
+        falling back to exponential backoff otherwise. Integrates with the
+        circuit breaker to short-circuit requests when the remote agent is
+        consistently failing.
+        """
+        if self._handler is None:
+            raise RuntimeError("Handler not initialized — call initialize() first")
+
+        # Check circuit breaker before attempting
+        cb_state = self._circuit_breaker.state
+        if cb_state == CircuitState.OPEN:
+            raise CircuitOpenError(
+                f"Circuit breaker is open for {self._config.normalized_url} "
+                f"— too many consecutive failures"
+            )
 
         retry = self._config.retry
         last_error: Exception | None = None
 
         for attempt in range(retry.max_retries + 1):
             try:
-                return await self._handler.send(message, **kwargs)
+                result = await self._handler.send(message, **kwargs)
+                self._circuit_breaker.record_success()
+                return result
             except ProtocolError as exc:
                 last_error = exc
+                self._circuit_breaker.record_failure()
                 if exc.status_code and exc.status_code not in retry.retry_on:
                     raise
                 if attempt < retry.max_retries:
-                    wait = retry.backoff_factor * (2**attempt)
+                    wait = self._compute_retry_wait(exc, retry.backoff_factor, attempt)
                     logger.warning(
                         "Request failed (attempt %d/%d), retrying in %.1fs: %s",
                         attempt + 1,
@@ -409,14 +522,32 @@ class HttpAgentAdapter(BaseAgentAdapter):
                     )
                     await asyncio.sleep(wait)
 
-        assert last_error is not None
+        if last_error is None:
+            raise RuntimeError("Retry loop exited without capturing an error")
         raise last_error
+
+    @staticmethod
+    def _compute_retry_wait(exc: ProtocolError, backoff_factor: float, attempt: int) -> float:
+        """Compute the wait time for a retry attempt.
+
+        Uses the ``Retry-After`` header value (in seconds) for 429 responses
+        when present, otherwise falls back to exponential backoff.
+        """
+        if exc.status_code == 429 and exc.headers:
+            retry_after = exc.headers.get("Retry-After") or exc.headers.get("retry-after")
+            if retry_after is not None:
+                try:
+                    return max(0.0, min(float(retry_after), 120.0))
+                except (ValueError, TypeError):
+                    pass
+        return float(backoff_factor * (2**attempt))
 
     # ── Probe-Based Discovery ────────────────────────────────────
 
     async def _probe_discover(self) -> list[AgentCapability]:
         """Send probe prompts and parse capabilities from responses."""
-        assert self._handler is not None
+        if self._handler is None:
+            raise RuntimeError("Handler not initialized — call initialize() first")
 
         discovered: list[AgentCapability] = []
         seen_names: set[str] = set()

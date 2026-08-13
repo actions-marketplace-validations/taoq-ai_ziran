@@ -1,8 +1,8 @@
 """Tests for CLI commands — exercises every Click command via CliRunner.
 
 Covers: scan, discover, library, report, poc, policy, audit, ci, plus
-the internal helpers _load_agent_adapter, _load_remote_adapter,
-_load_python_object, _display_results, _save_results, etc.
+display and save helpers. Factory functions (load_agent_adapter,
+load_remote_adapter, build_strategy) are in ziran.application.factories.
 
 Every external side-effect (file I/O, asyncio.run, adapter loading) is
 mocked so these tests are fast and deterministic.
@@ -141,10 +141,15 @@ class TestScanCommand:
         result = runner.invoke(cli, ["scan", "--framework", "langchain"])
         assert result.exit_code != 0
 
-    @patch("ziran.interfaces.cli.main._load_agent_adapter")
+    @patch("ziran.interfaces.cli.main.load_agent_adapter")
+    @patch("ziran.interfaces.cli.main.AgentScanner")
     @patch("ziran.interfaces.cli.main.asyncio")
     def test_scan_local_success(
-        self, mock_asyncio: MagicMock, mock_load: MagicMock, runner: CliRunner
+        self,
+        mock_asyncio: MagicMock,
+        mock_scanner_cls: MagicMock,
+        mock_load: MagicMock,
+        runner: CliRunner,
     ) -> None:
         """Scan with --framework + --agent-path should go through the local path."""
         mock_adapter = MagicMock()
@@ -156,6 +161,10 @@ class TestScanCommand:
         result_data = _minimal_campaign_result()
         mock_result = CampaignResult.model_validate(result_data)
         mock_asyncio.run.return_value = mock_result
+
+        # Mock AgentScanner so run_campaign doesn't create a real coroutine
+        mock_scanner = MagicMock()
+        mock_scanner_cls.return_value = mock_scanner
 
         with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
             f.write("agent_executor = None\n")
@@ -182,6 +191,7 @@ class TestScanCommand:
         assert result.exit_code == 0
         assert "--attack-timeout" in result.output
         assert "--phase-timeout" in result.output
+        assert "--resume" in result.output
 
 
 # ── discover command ────────────────────────────────────────────────
@@ -357,11 +367,11 @@ class TestCiCommand:
             )
         assert result.exit_code in (0, 1)
 
-    def test_ci_with_sarif(self, runner: CliRunner) -> None:
+    def test_ci_with_sarif(self, runner: CliRunner, tmp_path: Path) -> None:
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
             json.dump(_minimal_campaign_result(), f)
             f.flush()
-            sarif_path = tempfile.mktemp(suffix=".sarif")
+            sarif_path = str(tmp_path / "out.sarif")
             result = runner.invoke(
                 cli,
                 [
@@ -383,12 +393,12 @@ class TestCiCommand:
         assert result.exit_code != 0
 
 
-# ── Helper: _load_python_object ─────────────────────────────────────
+# ── Helper: _load_python_object (now in ziran.application.factories) ──
 
 
 class TestLoadPythonObject:
     def test_load_existing_object(self) -> None:
-        from ziran.interfaces.cli.main import _load_python_object
+        from ziran.application.factories import _load_python_object
 
         with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
             f.write("my_var = 42\n")
@@ -397,33 +407,33 @@ class TestLoadPythonObject:
         assert obj == 42
 
     def test_load_missing_object(self) -> None:
-        from ziran.interfaces.cli.main import _load_python_object
+        from ziran.application.factories import _load_python_object
 
         with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
             f.write("x = 1\n")
             f.flush()
-            with pytest.raises(Exception, match="not found"):
+            with pytest.raises(ValueError, match="not found"):
                 _load_python_object(f.name, "nonexistent")
 
     def test_load_missing_file(self) -> None:
-        from ziran.interfaces.cli.main import _load_python_object
+        from ziran.application.factories import _load_python_object
 
-        with pytest.raises(Exception, match=r"not found|No such file"):
+        with pytest.raises(FileNotFoundError, match=r"not found|No such file"):
             _load_python_object("/nonexistent/path.py", "obj")
 
 
-# ── Helper: _load_bedrock_config ────────────────────────────────────
+# ── Helper: _load_bedrock_config (now in ziran.application.factories) ──
 
 
 class TestLoadBedrockConfig:
     def test_load_agent_id_string(self) -> None:
-        from ziran.interfaces.cli.main import _load_bedrock_config
+        from ziran.application.factories import _load_bedrock_config
 
         result = _load_bedrock_config("my-agent-id")
         assert result == {"agent_id": "my-agent-id"}
 
     def test_load_yaml_config(self) -> None:
-        from ziran.interfaces.cli.main import _load_bedrock_config
+        from ziran.application.factories import _load_bedrock_config
 
         with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
             f.write("agent_id: abc123\nregion_name: us-east-1\n")
@@ -433,24 +443,24 @@ class TestLoadBedrockConfig:
         assert result["region_name"] == "us-east-1"
 
     def test_load_invalid_yaml_config(self) -> None:
-        from ziran.interfaces.cli.main import _load_bedrock_config
+        from ziran.application.factories import _load_bedrock_config
 
         with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
             f.write("- just_a_list\n")
             f.flush()
-            with pytest.raises(Exception, match="agent_id"):
+            with pytest.raises(ValueError, match="agent_id"):
                 _load_bedrock_config(f.name)
 
 
-# ── Helper: _load_agent_adapter ────────────────────────────────────
+# ── Helper: load_agent_adapter (now in ziran.application.factories) ──
 
 
 class TestLoadAgentAdapter:
     def test_unsupported_framework(self) -> None:
-        from ziran.interfaces.cli.main import _load_agent_adapter
+        from ziran.application.factories import load_agent_adapter
 
-        with pytest.raises(Exception, match="Unsupported"):
-            _load_agent_adapter("unknown_framework", "dummy.py")
+        with pytest.raises(ValueError, match="Unsupported"):
+            load_agent_adapter("unknown_framework", "dummy.py")
 
 
 # ── Helper: _display_results ────────────────────────────────────────
@@ -470,3 +480,167 @@ class TestDisplayResults:
 
         result = CampaignResult.model_validate(_vulnerable_campaign_result())
         _display_results(result)  # Should not raise
+
+
+# ── dry-run mode ──────────────────────────────────────────────────────
+
+
+class TestDryRun:
+    def test_scan_help_includes_dry_run(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["scan", "--help"])
+        assert "--dry-run" in result.output
+
+    @patch("ziran.interfaces.cli.main.load_agent_adapter")
+    @patch("ziran.interfaces.cli.main.asyncio")
+    def test_dry_run_does_not_execute_campaign(
+        self, mock_asyncio: MagicMock, mock_load: MagicMock, runner: CliRunner
+    ) -> None:
+        """--dry-run should NOT call scanner.run_campaign."""
+        mock_adapter = MagicMock()
+        mock_load.return_value = mock_adapter
+
+        # discover_capabilities returns a list of capabilities
+        mock_cap = MagicMock()
+        mock_cap.dangerous = True
+        mock_asyncio.run.return_value = [mock_cap]
+
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
+            f.write("agent_executor = None\n")
+            f.flush()
+            result = runner.invoke(
+                cli,
+                [
+                    "scan",
+                    "--framework",
+                    "langchain",
+                    "--agent-path",
+                    f.name,
+                    "--dry-run",
+                ],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0
+        assert "Dry Run Summary" in result.output or "Configuration valid" in result.output
+
+    @patch("ziran.interfaces.cli.main.load_remote_adapter")
+    @patch("ziran.interfaces.cli.main.asyncio")
+    def test_dry_run_remote_target(
+        self, mock_asyncio: MagicMock, mock_load: MagicMock, runner: CliRunner
+    ) -> None:
+        """--dry-run with --target should load adapter and show summary."""
+        mock_adapter = MagicMock()
+        mock_config = MagicMock()
+        mock_config.url = "https://agent.example.com"
+        mock_config.protocol.value = "openai"
+        mock_config.auth = None
+        mock_load.return_value = (mock_adapter, mock_config)
+
+        mock_cap = MagicMock()
+        mock_cap.dangerous = False
+        mock_asyncio.run.return_value = [mock_cap]
+
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
+            f.write("url: https://agent.example.com\n")
+            f.flush()
+            result = runner.invoke(
+                cli,
+                ["scan", "--target", f.name, "--dry-run"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0
+
+
+# ── config validation warnings ────────────────────────────────────────
+
+
+class TestConfigValidationWarnings:
+    def test_attack_timeout_exceeds_phase_timeout(self) -> None:
+        from ziran.interfaces.cli.main import _warn_config_issues
+
+        # Should not raise — just prints warnings
+        _warn_config_issues(
+            attack_timeout=600.0,
+            phase_timeout=300.0,
+            concurrency=5,
+            strategy="fixed",
+            llm_provider=None,
+            encoding=(),
+        )
+
+    def test_high_concurrency_warning(self) -> None:
+        from ziran.interfaces.cli.main import _warn_config_issues
+
+        _warn_config_issues(
+            attack_timeout=60.0,
+            phase_timeout=300.0,
+            concurrency=100,
+            strategy="fixed",
+            llm_provider=None,
+            encoding=(),
+        )
+
+    def test_llm_adaptive_without_provider(self) -> None:
+        from ziran.interfaces.cli.main import _warn_config_issues
+
+        _warn_config_issues(
+            attack_timeout=60.0,
+            phase_timeout=300.0,
+            concurrency=5,
+            strategy="llm-adaptive",
+            llm_provider=None,
+            encoding=(),
+        )
+
+    def test_no_warnings_with_valid_config(self) -> None:
+        from ziran.interfaces.cli.main import _warn_config_issues
+
+        # Should produce no warnings
+        _warn_config_issues(
+            attack_timeout=60.0,
+            phase_timeout=300.0,
+            concurrency=5,
+            strategy="fixed",
+            llm_provider=None,
+            encoding=(),
+        )
+
+
+# ── validate command ──────────────────────────────────────────────────
+
+
+class TestValidateCommand:
+    def test_validate_help(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["validate", "--help"])
+        assert result.exit_code == 0
+        assert "Validate" in result.output or "validate" in result.output
+
+    def test_validate_valid_yaml(self, runner: CliRunner) -> None:
+        """Valid YAML config should pass parse and schema checks."""
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
+            f.write("url: https://agent.example.com\nprotocol: openai\n")
+            f.flush()
+            result = runner.invoke(cli, ["validate", f.name])
+
+        # URL is not actually reachable, but parse+schema should pass
+        assert "YAML parse" in result.output
+        assert "Config schema" in result.output
+
+    def test_validate_invalid_yaml(self, runner: CliRunner) -> None:
+        """Invalid YAML should fail with a clear error."""
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
+            f.write("{{not: valid: yaml:::\n")
+            f.flush()
+            result = runner.invoke(cli, ["validate", f.name])
+
+        assert result.exit_code != 0
+
+    def test_validate_invalid_schema(self, runner: CliRunner) -> None:
+        """Valid YAML but missing required fields should fail schema validation."""
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
+            f.write("name: missing_url_field\n")
+            f.flush()
+            result = runner.invoke(cli, ["validate", f.name])
+
+        assert result.exit_code != 0

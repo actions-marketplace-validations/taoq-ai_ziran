@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
-from ziran.application.attacks.library import AttackLibrary
+if TYPE_CHECKING:
+    from ziran.application.attacks.library import AttackLibrary
 from ziran.domain.entities.attack import (
     OWASP_LLM_DESCRIPTIONS,
     AttackCategory,
@@ -133,8 +136,8 @@ class TestAttackLibraryOwasp:
     """Tests for OWASP filtering in AttackLibrary."""
 
     @pytest.fixture
-    def library(self) -> AttackLibrary:
-        return AttackLibrary()
+    def library(self, shared_attack_library: AttackLibrary) -> AttackLibrary:
+        return shared_attack_library
 
     def test_all_builtin_vectors_have_owasp_mapping(self, library: AttackLibrary) -> None:
         """Every built-in vector should have at least one OWASP mapping."""
@@ -153,21 +156,61 @@ class TestAttackLibraryOwasp:
         for attack in lmm07_attacks:
             assert OwaspLlmCategory.LLM07 in attack.owasp_mapping
 
-    def test_prompt_injection_maps_to_lmm01(self, library: AttackLibrary) -> None:
+    def test_prompt_injection_vectors_have_relevant_owasp_mapping(
+        self, library: AttackLibrary
+    ) -> None:
+        """Prompt-injection vectors must carry at least one OWASP category.
+
+        The dominant category is LLM01, but some vectors legitimately map
+        to LLM02 (Insecure Output Handling — e.g., unsafe-code-generation
+        vectors under the prompt_injection category after spec 012). The
+        invariant is that every vector in the prompt_injection category
+        carries at least one relevant OWASP mapping.
+        """
+        relevant = {
+            OwaspLlmCategory.LLM01,
+            OwaspLlmCategory.LLM02,
+            OwaspLlmCategory.LLM06,
+        }
         pi_attacks = library.get_attacks_by_category(AttackCategory.PROMPT_INJECTION)
         for attack in pi_attacks:
-            assert OwaspLlmCategory.LLM01 in attack.owasp_mapping
+            assert relevant.intersection(attack.owasp_mapping), (
+                f"Vector '{attack.id}' missing any of {sorted(c.value for c in relevant)} "
+                f"in owasp_mapping: {attack.owasp_mapping}"
+            )
 
-    def test_data_exfiltration_maps_to_lmm02_and_lmm06(self, library: AttackLibrary) -> None:
+    def test_data_exfiltration_has_relevant_owasp_mapping(self, library: AttackLibrary) -> None:
+        """Data-exfiltration vectors should map to a relevant OWASP category.
+
+        Typical mappings are LLM02 (Insecure Output Handling) or LLM07
+        (Insecure Plugin Design). After spec 012, model-theft vectors
+        under the data_exfiltration category also legitimately carry
+        LLM10 (Unbounded Consumption) and LLM06 (Sensitive Information
+        Disclosure).
+        """
+        relevant = {
+            OwaspLlmCategory.LLM02,
+            OwaspLlmCategory.LLM06,
+            OwaspLlmCategory.LLM07,
+            OwaspLlmCategory.LLM10,
+        }
         de_attacks = library.get_attacks_by_category(AttackCategory.DATA_EXFILTRATION)
         for attack in de_attacks:
-            assert OwaspLlmCategory.LLM02 in attack.owasp_mapping
-            assert OwaspLlmCategory.LLM06 in attack.owasp_mapping
+            assert relevant.intersection(attack.owasp_mapping), (
+                f"Vector '{attack.id}' missing any of "
+                f"{sorted(c.value for c in relevant)} in owasp_mapping: "
+                f"{attack.owasp_mapping}"
+            )
 
-    def test_get_attacks_by_owasp_untested_returns_empty(self, library: AttackLibrary) -> None:
-        """LLM04 (DoS) and LLM05 (Supply Chain) aren't mapped to any built-in vector."""
+    def test_get_attacks_by_owasp_lmm05_supply_chain(self, library: AttackLibrary) -> None:
+        """LLM05 (Supply Chain) should have MCP supply chain vectors."""
+        lmm05 = library.get_attacks_by_owasp(OwaspLlmCategory.LLM05)
+        assert len(lmm05) >= 1, "Expected LLM05 vectors from MCP supply chain attacks"
+
+    def test_lmm04_dos_vectors_exist(self, library: AttackLibrary) -> None:
+        """LLM04 (Model DoS) vectors should exist."""
         lmm04 = library.get_attacks_by_owasp(OwaspLlmCategory.LLM04)
-        assert lmm04 == []
+        assert len(lmm04) >= 12
 
     def test_owasp_mapping_loaded_from_yaml(self, library: AttackLibrary) -> None:
         """Verify a specific vector's OWASP mapping was loaded from YAML."""

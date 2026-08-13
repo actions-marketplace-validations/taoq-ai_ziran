@@ -11,12 +11,46 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from ziran.domain.entities.attack import OWASP_LLM_DESCRIPTIONS, OwaspLlmCategory
+from ziran.domain.entities.attack import (
+    AGENT_SPECIFIC_TECHNIQUES,
+    ATLAS_TACTIC_DESCRIPTIONS,
+    ATLAS_TECHNIQUE_DESCRIPTIONS,
+    ATLAS_TECHNIQUE_TO_TACTIC,
+    BUSINESS_IMPACT_DESCRIPTIONS,
+    HARM_CATEGORY_DESCRIPTIONS,
+    OWASP_LLM_DESCRIPTIONS,
+    AtlasTactic,
+    AtlasTechnique,
+    AttackCategory,
+    BusinessImpact,
+    HarmCategory,
+    OwaspLlmCategory,
+    get_business_impacts,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from ziran.domain.entities.phase import CampaignResult
+
+
+def _dump_campaign_result(result: CampaignResult) -> dict[str, Any]:
+    """Serialise a CampaignResult, stripping only the spec 012 US5 fields when unset.
+
+    Pydantic's ``exclude_none`` is recursive and would strip pre-existing
+    ``None`` fields on nested models (e.g. ``agent_response``), which would
+    break downstream consumers. We only drop the two fields introduced in
+    spec 012 US5 — ``defence_profile`` and ``evasion_rate`` — so that reports
+    for campaigns without a declared profile remain byte-identical to
+    pre-spec-012 output. Downstream signing (issue #259 asqav) depends on
+    this determinism (FR-020 / SC-005).
+    """
+    data = result.model_dump(mode="json")
+    if data.get("defence_profile") is None:
+        data.pop("defence_profile", None)
+    if data.get("evasion_rate") is None:
+        data.pop("evasion_rate", None)
+    return data
 
 
 class ReportGenerator:
@@ -52,7 +86,7 @@ class ReportGenerator:
             Path to the saved JSON file.
         """
         filepath = self.output_dir / f"{result.campaign_id}_report.json"
-        data = result.model_dump(mode="json")
+        data = _dump_campaign_result(result)
 
         with filepath.open("w") as f:
             json.dump(data, f, indent=2, default=str)
@@ -107,7 +141,7 @@ class ReportGenerator:
             if graph_state is None:
                 graph_state = {"nodes": [], "edges": [], "stats": {}}
 
-        result_data = result.model_dump(mode="json")
+        result_data = _dump_campaign_result(result)
         html_content = build_html_report(
             result_data=result_data,
             graph_state=graph_state,
@@ -144,12 +178,39 @@ class ReportGenerator:
         lines.append("| Metric | Value |")
         lines.append("|--------|-------|")
         lines.append(f"| Phases Executed | {len(result.phases_executed)} |")
-        lines.append(f"| Total Vulnerabilities | {result.total_vulnerabilities} |")
+        lines.append(f"| Prompt-level Vulnerabilities | {result.total_vulnerabilities} |")
+        lines.append(
+            "| Composition Findings (tool chains) | "
+            f"{len(result.dangerous_tool_chains)} ({result.critical_chain_count} critical) |"
+        )
         lines.append(f"| Critical Attack Paths | {len(result.critical_paths)} |")
         lines.append(f"| Final Trust Score | {result.final_trust_score:.2f} |")
         lines.append(f"| Overall Result | {'⚠️ VULNERABLE' if result.success else '✅ PASSED'} |")
         if result.coverage_level:
             lines.append(f"| Coverage Level | {result.coverage_level} |")
+
+        # Quality-weighted ASR (StrongREJECT-style) if quality scores are present
+        quality_scores = self._extract_quality_scores(result)
+        if quality_scores:
+            binary_asr = sum(1 for ar in result.attack_results if ar.get("successful")) / max(
+                len(result.attack_results), 1
+            )
+            avg_quality = sum(quality_scores) / len(quality_scores)
+            quality_weighted_asr = binary_asr * avg_quality
+            lines.append(f"| Binary ASR | {binary_asr:.1%} |")
+            lines.append(f"| Avg Quality Score | {avg_quality:.2f} |")
+            lines.append(f"| Quality-Weighted ASR | {quality_weighted_asr:.1%} |")
+
+        # Resilience metrics (AILuminate-style)
+        if result.resilience:
+            r = result.resilience
+            lines.append(f"| Attack Resilience Rate | {r.attack_resilience_rate:.1%} |")
+            lines.append(f"| Trust Degradation | {r.trust_degradation:.2f} |")
+            lines.append(f"| **Resilience Score** | **{r.resilience_score:.1%}** |")
+            lines.append(f"| Baseline Performance | {r.baseline_performance:.1%} |")
+            lines.append(f"| Under-Attack Performance | {r.under_attack_performance:.1%} |")
+            lines.append(f"| **Resilience Gap** | **{r.resilience_gap:.1%}** |")
+
         lines.append("")
 
         # Token Usage
@@ -208,6 +269,128 @@ class ReportGenerator:
                     status = "⚪ Not tested"
                     findings = "—"
                 lines.append(f"| {cat.value} | {desc} | {status} | {findings} |")
+            lines.append("")
+
+        # MITRE ATLAS Coverage Summary — mirrors OWASP structure, grouped by tactic.
+        atlas_findings: Counter[AtlasTechnique] = Counter()
+        atlas_tested: set[AtlasTechnique] = set()
+        for phase_result in result.phases_executed:
+            for _vid, artifact in phase_result.artifacts.items():
+                for t_val in artifact.get("atlas_mapping", []) or []:
+                    try:
+                        tech = AtlasTechnique(t_val)
+                    except ValueError:
+                        continue
+                    atlas_tested.add(tech)
+                    if _vid in phase_result.vulnerabilities_found:
+                        atlas_findings[tech] += 1
+        for ar in getattr(result, "attack_results", []):
+            for t_val in getattr(ar, "atlas_mapping", []) or []:
+                try:
+                    tech = AtlasTechnique(t_val)
+                except ValueError:
+                    continue
+                atlas_tested.add(tech)
+                if ar.successful:
+                    atlas_findings[tech] += 1
+
+        if atlas_tested:
+            lines.append("## MITRE ATLAS Coverage")
+            lines.append("")
+            by_tactic: dict[AtlasTactic, list[AtlasTechnique]] = {}
+            for tech in sorted(atlas_tested, key=lambda t: t.value):
+                for tactic in ATLAS_TECHNIQUE_TO_TACTIC.get(tech, []):
+                    by_tactic.setdefault(tactic, []).append(tech)
+            lines.append("| Tactic | Technique | Status | Findings |")
+            lines.append("|--------|-----------|--------|----------|")
+            for tactic in AtlasTactic:
+                if tactic not in by_tactic:
+                    continue
+                tactic_name = ATLAS_TACTIC_DESCRIPTIONS.get(tactic, tactic.value)
+                for tech in by_tactic[tactic]:
+                    desc = ATLAS_TECHNIQUE_DESCRIPTIONS.get(tech, tech.value)
+                    badge = " 🎯" if tech in AGENT_SPECIFIC_TECHNIQUES else ""
+                    if tech in atlas_findings:
+                        count = atlas_findings[tech]
+                        status = "🔴 FAIL"
+                        findings = f"{count} vulnerabilit{'y' if count == 1 else 'ies'}"
+                    else:
+                        status = "✅ PASS"
+                        findings = "—"
+                    lines.append(
+                        f"| {tactic.value} ({tactic_name}) | {tech.value} — {desc}{badge} "
+                        f"| {status} | {findings} |"
+                    )
+            lines.append("")
+            lines.append("_🎯 = AI-agent-specific ATLAS technique (October 2025 release)._")
+            lines.append("")
+
+        # Declared Defences + evasion rate (spec 012 US5).
+        # When no profile is declared, this section is omitted entirely so
+        # the report is byte-identical to pre-spec-012 reports for the same
+        # target (FR-017 / SC-005).
+        if result.defence_profile and not result.defence_profile.is_empty:
+            lines.append("## Declared Defences")
+            lines.append("")
+            lines.append(f"**Profile:** `{result.defence_profile.name}`")
+            lines.append("")
+            lines.append("| Kind | Identifier | Evaluable |")
+            lines.append("|------|------------|-----------|")
+            for d in result.defence_profile.defences:
+                evaluable = "yes" if d.evaluable else "no"
+                lines.append(f"| {d.kind} | `{d.identifier}` | {evaluable} |")
+            lines.append("")
+            if result.evasion_rate is not None:
+                lines.append(
+                    f"**Evasion rate:** {result.evasion_rate:.1%} "
+                    "(successful attacks that bypassed all evaluable defences)"
+                )
+            else:
+                lines.append(
+                    "**Evasion rate:** not computable — no declared defence "
+                    "is marked `evaluable: true` in this release."
+                )
+            lines.append("")
+
+        # Business Impact Summary (successful findings only)
+        impact_counts: Counter[BusinessImpact] = Counter()
+        for ar in getattr(result, "attack_results", []):
+            successful = (
+                ar.get("successful") if isinstance(ar, dict) else getattr(ar, "successful", False)
+            )
+            if not successful:
+                continue
+            # Prefer stored business_impact; fall back to computing it
+            raw_impacts = (
+                ar.get("business_impact", [])
+                if isinstance(ar, dict)
+                else getattr(ar, "business_impact", [])
+            )
+            if raw_impacts:
+                impacts = [BusinessImpact(v) for v in raw_impacts]
+            else:
+                cat_val = (
+                    ar.get("category") if isinstance(ar, dict) else getattr(ar, "category", None)
+                )
+                sev_val = (
+                    ar.get("severity") if isinstance(ar, dict) else getattr(ar, "severity", None)
+                )
+                if cat_val and sev_val:
+                    impacts = get_business_impacts(AttackCategory(cat_val), sev_val)
+                else:
+                    impacts = []
+            for imp in impacts:
+                impact_counts[imp] += 1
+
+        if impact_counts:
+            lines.append("## Business Impact Summary")
+            lines.append("")
+            lines.append("| Impact Category | Description | Findings |")
+            lines.append("|-----------------|-------------|----------|")
+            for imp in BusinessImpact:
+                if imp in impact_counts:
+                    desc = BUSINESS_IMPACT_DESCRIPTIONS.get(imp, imp.value)
+                    lines.append(f"| {imp.value} | {desc} | {impact_counts[imp]} |")
             lines.append("")
 
         # Phase Results
@@ -287,6 +470,37 @@ class ReportGenerator:
                     lines.append(f"- **{tools}**: {chain['remediation']}")
                 lines.append("")
 
+        # Harm Category Breakdown (harmful task scenarios only)
+        harm_counts: Counter[str] = Counter()
+        for ar in result.attack_results:
+            if ar.get("successful") and ar.get("harm_category") is not None:
+                cat_val = ar["harm_category"]
+                desc = HARM_CATEGORY_DESCRIPTIONS.get(HarmCategory(cat_val), cat_val)
+                harm_counts[desc] += 1
+        if harm_counts:
+            lines.append("## Harmful Task Scenarios")
+            lines.append("")
+            lines.append("| Harm Category | Successful Attacks |")
+            lines.append("|--------------|-------------------|")
+            for cat_desc, count in harm_counts.most_common():
+                lines.append(f"| {cat_desc} | {count} |")
+            lines.append("")
+
+        # Utility-Under-Attack metrics
+        utility = result.metadata.get("utility")
+        if utility:
+            lines.append("## Utility-Under-Attack")
+            lines.append("")
+            lines.append("| Metric | Value |")
+            lines.append("|--------|-------|")
+            lines.append(f"| Baseline Utility | {utility['baseline_score']:.1%} |")
+            lines.append(f"| Post-Attack Utility | {utility['post_attack_score']:.1%} |")
+            delta = utility["utility_delta"]
+            delta_icon = "🔴" if delta > 0.1 else "🟡" if delta > 0 else "🟢"
+            lines.append(f"| {delta_icon} Utility Delta | {delta:.1%} |")
+            lines.append(f"| Tasks Evaluated | {utility['tasks_run']} |")
+            lines.append("")
+
         # Footer
         lines.append("---")
         lines.append(
@@ -296,3 +510,20 @@ class ReportGenerator:
         lines.append("")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_quality_scores(result: CampaignResult) -> list[float]:
+        """Extract quality scores from successful attack results.
+
+        Returns a list of composite quality scores for attacks that have them.
+        """
+        scores: list[float] = []
+        for ar in getattr(result, "attack_results", []):
+            qs = (
+                ar.get("quality_score")
+                if isinstance(ar, dict)
+                else getattr(ar, "quality_score", None)
+            )
+            if qs is not None and isinstance(qs, (int, float)):
+                scores.append(float(qs))
+        return scores

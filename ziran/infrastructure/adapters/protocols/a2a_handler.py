@@ -25,7 +25,11 @@ from ziran.domain.entities.a2a import (
     A2ATask,
 )
 from ziran.domain.entities.target import A2AConfig, TargetConfig
-from ziran.infrastructure.adapters.protocols import BaseProtocolHandler, ProtocolError
+from ziran.infrastructure.adapters.protocols import (
+    BaseProtocolHandler,
+    ProtocolError,
+    ProtocolResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +55,7 @@ class A2AProtocolHandler(BaseProtocolHandler):
 
     # ── Public API ───────────────────────────────────────────────
 
-    async def send(self, message: str, **kwargs: Any) -> dict[str, Any]:
+    async def send(self, message: str, **kwargs: Any) -> ProtocolResponse:
         """Send a message to the A2A agent.
 
         Builds a ``SendMessageRequest``, dispatches it via the
@@ -202,7 +206,9 @@ class A2AProtocolHandler(BaseProtocolHandler):
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             msg = f"Failed to fetch Agent Card: HTTP {exc.response.status_code}"
-            raise ProtocolError(msg, status_code=exc.response.status_code) from exc
+            raise ProtocolError(
+                msg, status_code=exc.response.status_code, headers=dict(exc.response.headers)
+            ) from exc
         except httpx.HTTPError as exc:
             msg = f"Failed to fetch Agent Card: {exc}"
             raise ProtocolError(msg) from exc
@@ -268,7 +274,9 @@ class A2AProtocolHandler(BaseProtocolHandler):
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             msg = f"A2A SendMessage failed: HTTP {exc.response.status_code}"
-            raise ProtocolError(msg, status_code=exc.response.status_code) from exc
+            raise ProtocolError(
+                msg, status_code=exc.response.status_code, headers=dict(exc.response.headers)
+            ) from exc
         except httpx.HTTPError as exc:
             msg = f"A2A SendMessage failed: {exc}"
             raise ProtocolError(msg) from exc
@@ -298,7 +306,9 @@ class A2AProtocolHandler(BaseProtocolHandler):
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             msg = f"A2A JSON-RPC SendMessage failed: HTTP {exc.response.status_code}"
-            raise ProtocolError(msg, status_code=exc.response.status_code) from exc
+            raise ProtocolError(
+                msg, status_code=exc.response.status_code, headers=dict(exc.response.headers)
+            ) from exc
         except httpx.HTTPError as exc:
             msg = f"A2A JSON-RPC SendMessage failed: {exc}"
             raise ProtocolError(msg) from exc

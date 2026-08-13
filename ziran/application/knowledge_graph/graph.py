@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 import networkx as nx
 
 if TYPE_CHECKING:
-    from ziran.domain.entities.capability import AgentCapability
+    from ziran.domain.entities.capability import AgentCapability, DangerousChain
 
 
 class NodeType:
@@ -46,6 +46,14 @@ class EdgeType:
     TRUST_BOUNDARY = "trust_boundary"
 
 
+# Edge types that attribute a node to the phase in which it was discovered.
+_PHASE_EDGE_TYPES = frozenset({EdgeType.DISCOVERED_IN, "executed_in"})
+
+# Above this node count, skip betweenness centrality (O(V*E)) to keep
+# ``export_state`` responsive on very large graphs; centrality defaults to 0.0.
+_MAX_CENTRALITY_NODES = 800
+
+
 class AttackKnowledgeGraph:
     """NetworkX-based knowledge graph tracking attack campaign state.
 
@@ -67,6 +75,11 @@ class AttackKnowledgeGraph:
     def __init__(self) -> None:
         self.graph: nx.MultiDiGraph = nx.MultiDiGraph()
         self.campaign_start: datetime = datetime.now(tz=UTC)
+        self._cached_state: dict[str, Any] | None = None
+
+    def _invalidate_cache(self) -> None:
+        """Mark the cached export state as stale."""
+        self._cached_state = None
 
     @property
     def node_count(self) -> int:
@@ -85,6 +98,7 @@ class AttackKnowledgeGraph:
             state_id: Unique identifier for this state snapshot.
             attributes: Arbitrary key-value attributes describing the state.
         """
+        self._invalidate_cache()
         self.graph.add_node(
             state_id,
             node_type=NodeType.AGENT_STATE,
@@ -99,6 +113,7 @@ class AttackKnowledgeGraph:
             cap_id: Unique node ID for this capability.
             capability: The capability model with full metadata.
         """
+        self._invalidate_cache()
         self.graph.add_node(
             cap_id,
             node_type=NodeType.CAPABILITY,
@@ -114,6 +129,7 @@ class AttackKnowledgeGraph:
             tool_id: Unique identifier for the tool.
             attributes: Optional metadata about the tool.
         """
+        self._invalidate_cache()
         self.graph.add_node(
             tool_id,
             node_type=NodeType.TOOL,
@@ -134,6 +150,7 @@ class AttackKnowledgeGraph:
             severity: Severity level (low, medium, high, critical).
             attributes: Additional metadata about the vulnerability.
         """
+        self._invalidate_cache()
         self.graph.add_node(
             vuln_id,
             node_type=NodeType.VULNERABILITY,
@@ -149,6 +166,7 @@ class AttackKnowledgeGraph:
             source_id: Unique identifier for the data source.
             attributes: Metadata about the data source.
         """
+        self._invalidate_cache()
         self.graph.add_node(
             source_id,
             node_type=NodeType.DATA_SOURCE,
@@ -174,6 +192,7 @@ class AttackKnowledgeGraph:
             edge_type: Type of relationship (see EdgeType constants).
             attributes: Additional edge metadata.
         """
+        self._invalidate_cache()
         self.graph.add_edge(
             source,
             target,
@@ -192,6 +211,7 @@ class AttackKnowledgeGraph:
             tool_ids: Ordered list of tool node IDs forming the chain.
             risk_score: Aggregate risk score for this chain (0.0-1.0).
         """
+        self._invalidate_cache()
         for i in range(len(tool_ids) - 1):
             self.graph.add_edge(
                 tool_ids[i],
@@ -201,6 +221,50 @@ class AttackKnowledgeGraph:
                 chain_position=i,
                 timestamp=datetime.now(tz=UTC).isoformat(),
             )
+
+    def add_chain_finding(self, chain: DangerousChain) -> str:
+        """Surface a dangerous tool-composition as a first-class finding node.
+
+        Tool-composition risk is ZIRAN's differentiator, but a ``DangerousChain``
+        is otherwise only a side-list entry — invisible in the graph, the scan
+        verdict, and CI. This synthesises a ``VULNERABILITY`` node for the
+        composition and links it from each tool in the chain via ``EXPLOITS``
+        edges, so the chain renders as a red finding, is reachable by
+        attack-path enumeration, and is counted like any other finding.
+
+        The node carries ``finding_source="composition"`` so reports/consumers
+        can still distinguish a *latent* composition from a detector-*confirmed*
+        exploit.
+
+        Args:
+            chain: The dangerous chain discovered by :class:`ToolChainAnalyzer`.
+
+        Returns:
+            The id of the synthesised vulnerability node.
+        """
+        self._invalidate_cache()
+        tools = list(chain.tools)
+        vuln_id = f"composition::{chain.vulnerability_type}::{'->'.join(tools)}"
+        self.add_vulnerability(
+            vuln_id,
+            severity=chain.risk_level,
+            attributes={
+                "name": f"{chain.vulnerability_type}: {' → '.join(tools)}",
+                "category": "tool_composition",
+                "finding_source": "composition",
+                "vulnerability_type": chain.vulnerability_type,
+                "description": chain.exploit_description,
+                "remediation": chain.remediation,
+                "chain_type": chain.chain_type,
+                "risk_score": chain.risk_score,
+                "tools": tools,
+                "graph_path": list(chain.graph_path),
+            },
+        )
+        for tool in tools:
+            if tool in self.graph:
+                self.add_edge(tool, vuln_id, EdgeType.EXPLOITS, {"composition_finding": True})
+        return vuln_id
 
     def find_attack_paths(
         self,
@@ -236,33 +300,54 @@ class AttackKnowledgeGraph:
         except nx.NetworkXNoPath:
             return []
 
-    def find_all_attack_paths(self, max_path_length: int = 5) -> list[list[str]]:
+    def find_all_attack_paths(
+        self,
+        max_path_length: int = 5,
+        max_paths: int = 10_000,
+    ) -> list[list[str]]:
         """Find all attack paths from capabilities to vulnerabilities/data sources.
 
-        Searches for paths from every capability/tool node to every
-        vulnerability/data_source node.
+        Uses single-source path enumeration per source node so that each
+        source's reachable targets are discovered in one traversal instead
+        of the previous O(S*T) nested loop.
 
         Args:
             max_path_length: Maximum number of hops in a path.
+            max_paths: Cap on total paths returned to bound memory usage.
 
         Returns:
-            All discovered attack paths.
+            All discovered attack paths (up to *max_paths*).
         """
         sources = [
             n
             for n, d in self.graph.nodes(data=True)
             if d.get("node_type") in (NodeType.CAPABILITY, NodeType.TOOL)
         ]
-        targets = [
+        target_set = frozenset(
             n
             for n, d in self.graph.nodes(data=True)
             if d.get("node_type") in (NodeType.VULNERABILITY, NodeType.DATA_SOURCE)
-        ]
+        )
+
+        if not sources or not target_set:
+            return []
 
         all_paths: list[list[str]] = []
         for source in sources:
-            for target in targets:
-                all_paths.extend(self.find_attack_paths(source, target, max_path_length))
+            if source not in self.graph:
+                continue
+            try:
+                for path in nx.all_simple_paths(
+                    self.graph,
+                    source,
+                    target_set,
+                    cutoff=max_path_length,
+                ):
+                    all_paths.append(path)
+                    if len(all_paths) >= max_paths:
+                        return all_paths
+            except (nx.NetworkXError, nx.NodeNotFound):
+                continue
 
         return all_paths
 
@@ -311,14 +396,36 @@ class AttackKnowledgeGraph:
     def export_state(self) -> dict[str, Any]:
         """Export the full graph state for persistence or visualization.
 
+        Returns a cached copy when the graph has not been modified since
+        the last export, avoiding redundant O(V+E) serialization.
+
         Returns:
             Dictionary containing all nodes, edges, and campaign statistics.
         """
+        if self._cached_state is not None:
+            # Update only the dynamic duration field
+            now = datetime.now(tz=UTC)
+            self._cached_state["campaign_duration_seconds"] = (
+                now - self.campaign_start
+            ).total_seconds()
+            return self._cached_state
+
         now = datetime.now(tz=UTC)
         duration = (now - self.campaign_start).total_seconds()
 
-        return {
-            "nodes": [{"id": n, **d} for n, d in self.graph.nodes(data=True)],
+        centrality = self._normalized_centrality()
+        node_phase = self._derive_node_phases()
+
+        nodes: list[dict[str, Any]] = []
+        for n, d in self.graph.nodes(data=True):
+            node: dict[str, Any] = {"id": n, **d, "centrality": centrality.get(n, 0.0)}
+            phase = node_phase.get(n)
+            if phase is not None:
+                node["phase"] = phase
+            nodes.append(node)
+
+        state: dict[str, Any] = {
+            "nodes": nodes,
             "edges": [{"source": u, "target": v, **d} for u, v, d in self.graph.edges(data=True)],
             "campaign_start": self.campaign_start.isoformat(),
             "campaign_duration_seconds": duration,
@@ -329,6 +436,49 @@ class AttackKnowledgeGraph:
                 "node_types": self._count_node_types(),
             },
         }
+        self._cached_state = state
+        return state
+
+    def _normalized_centrality(self) -> dict[str, float]:
+        """Betweenness centrality per node, min-max normalized to ``[0, 1]``.
+
+        The most pivotal (chokepoint) node maps to ``1.0`` so the
+        visualization can size nodes by relative importance. Returns ``0.0``
+        for every node when the graph is too small for meaningful centrality
+        or large enough that the O(V*E) computation would be costly.
+        """
+        n_nodes = self.graph.number_of_nodes()
+        if n_nodes < 3 or n_nodes > _MAX_CENTRALITY_NODES:
+            return {}
+
+        raw: dict[str, float] = nx.betweenness_centrality(self.graph)
+        if not raw:
+            return {}
+        peak = max(raw.values())
+        if peak <= 0.0:
+            return {}
+        return {node: score / peak for node, score in raw.items()}
+
+    def _derive_node_phases(self) -> dict[str, str]:
+        """Map each node to the campaign phase it was discovered in.
+
+        A node is attributed to the earliest phase reached via a
+        ``discovered_in``/``executed_in`` edge to a ``phase`` node. Phase
+        nodes are attributed to themselves. Nodes with no such linkage are
+        omitted (callers treat them as "unassigned").
+        """
+        node_phase: dict[str, str] = {}
+        for u, v, data in self.graph.edges(data=True):
+            if data.get("edge_type") in _PHASE_EDGE_TYPES:
+                target = self.graph.nodes.get(v, {})
+                if target.get("node_type") == NodeType.PHASE and u not in node_phase:
+                    node_phase[u] = target.get("name", v)
+
+        for n, d in self.graph.nodes(data=True):
+            if d.get("node_type") == NodeType.PHASE:
+                node_phase[n] = d.get("name", n)
+
+        return node_phase
 
     def import_state(self, state: dict[str, Any]) -> None:
         """Import a previously exported graph state.
@@ -338,19 +488,26 @@ class AttackKnowledgeGraph:
         Args:
             state: Graph state dictionary from export_state().
         """
+        self._invalidate_cache()
         self.graph.clear()
 
         if "campaign_start" in state:
             self.campaign_start = datetime.fromisoformat(state["campaign_start"])
 
-        for node_data in state.get("nodes", []):
-            node_id = node_data.pop("id")
-            self.graph.add_node(node_id, **node_data)
+        for i, node_data in enumerate(state.get("nodes", [])):
+            if "id" not in node_data:
+                raise ValueError(f"Node at index {i} is missing required key 'id'")
+            node_attrs = {k: v for k, v in node_data.items() if k != "id"}
+            self.graph.add_node(node_data["id"], **node_attrs)
 
-        for edge_data in state.get("edges", []):
-            source = edge_data.pop("source")
-            target = edge_data.pop("target")
-            self.graph.add_edge(source, target, **edge_data)
+        for i, edge_data in enumerate(state.get("edges", [])):
+            missing = [k for k in ("source", "target") if k not in edge_data]
+            if missing:
+                raise ValueError(
+                    f"Edge at index {i} is missing required key(s): {', '.join(missing)}"
+                )
+            edge_attrs = {k: v for k, v in edge_data.items() if k not in ("source", "target")}
+            self.graph.add_edge(edge_data["source"], edge_data["target"], **edge_attrs)
 
     def _count_node_types(self) -> dict[str, int]:
         """Count nodes grouped by type."""
@@ -375,6 +532,7 @@ class AttackKnowledgeGraph:
             role: Agent role (supervisor, router, worker, specialist).
             metadata: Additional agent metadata.
         """
+        self._invalidate_cache()
         self.graph.add_node(
             agent_id,
             node_type=NodeType.AGENT,
@@ -397,6 +555,7 @@ class AttackKnowledgeGraph:
             delegation_pattern: How the delegation works.
             metadata: Additional edge metadata.
         """
+        self._invalidate_cache()
         self.graph.add_edge(
             source_agent,
             target_agent,
@@ -420,6 +579,7 @@ class AttackKnowledgeGraph:
             boundary_type: Type of trust boundary.
             metadata: Additional boundary metadata.
         """
+        self._invalidate_cache()
         self.graph.add_edge(
             agent_a,
             agent_b,
@@ -441,6 +601,7 @@ class AttackKnowledgeGraph:
             target_agent: Agent receiving data.
             data_shared: Types of data shared.
         """
+        self._invalidate_cache()
         self.graph.add_edge(
             source_agent,
             target_agent,
@@ -517,11 +678,6 @@ class AttackKnowledgeGraph:
                                     path[i], path[i + 1], default={}
                                 ).values()
                             )
-                            if isinstance(self.graph.get_edge_data(path[i], path[i + 1]), dict)
-                            else self.graph.get_edge_data(path[i], path[i + 1], default={}).get(
-                                "edge_type"
-                            )
-                            == EdgeType.DELEGATES_TO
                             for i in range(len(path) - 1)
                         )
                         if has_delegation:

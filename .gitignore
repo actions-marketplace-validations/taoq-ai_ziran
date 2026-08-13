@@ -15,8 +15,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -30,8 +30,9 @@ wheels/
 venv/
 ENV/
 
-# uv
-uv.lock
+# uv — root lockfile is committed for reproducible CI installs (uv sync --frozen);
+# nested example projects keep their own locks out of git.
+examples/uv.lock
 
 # IDE
 .idea/
@@ -72,3 +73,8 @@ reports/
 ziran_results/
 ziran-results.sarif
 .claude/
+
+# Web UI
+ziran/interfaces/web/static/
+ui/node_modules/
+ui/dist/

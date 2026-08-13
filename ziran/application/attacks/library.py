@@ -27,6 +27,7 @@ YAML Schema:
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -34,9 +35,12 @@ import yaml
 from pydantic import ValidationError
 
 from ziran.domain.entities.attack import (
+    AtlasTechnique,
     AttackCategory,
     AttackPrompt,
     AttackVector,
+    HarmCategory,
+    ManyShotConfig,
     OwaspLlmCategory,
     Severity,
 )
@@ -86,6 +90,12 @@ class AttackLibrary:
             load_builtin: Whether to load the built-in vector library.
         """
         self._vectors: dict[str, AttackVector] = {}
+        self._load_errors: list[tuple[str, Exception]] = []
+
+        # Filtering indices — rebuilt after loading
+        self._by_phase: dict[ScanPhase, list[AttackVector]] = defaultdict(list)
+        self._by_category: dict[AttackCategory, list[AttackVector]] = defaultdict(list)
+        self._by_severity: dict[Severity, list[AttackVector]] = defaultdict(list)
 
         if load_builtin:
             self._load_directory(_BUILTIN_VECTORS_DIR)
@@ -93,11 +103,32 @@ class AttackLibrary:
         for custom_dir in custom_dirs or []:
             self._load_directory(custom_dir)
 
-        logger.info(
-            "Attack library initialized with %d vectors from %d categories",
-            len(self._vectors),
-            len(self.categories),
-        )
+        self._rebuild_indices()
+
+        if self._load_errors:
+            logger.info(
+                "Attack library initialized with %d vectors from %d categories "
+                "(%d failed to parse)",
+                len(self._vectors),
+                len(self.categories),
+                len(self._load_errors),
+            )
+        else:
+            logger.info(
+                "Attack library initialized with %d vectors from %d categories",
+                len(self._vectors),
+                len(self.categories),
+            )
+
+    def _rebuild_indices(self) -> None:
+        """Rebuild filtering indices from the vector registry."""
+        self._by_phase = defaultdict(list)
+        self._by_category = defaultdict(list)
+        self._by_severity = defaultdict(list)
+        for v in self._vectors.values():
+            self._by_phase[v.target_phase].append(v)
+            self._by_category[v.category].append(v)
+            self._by_severity[v.severity].append(v)
 
     @property
     def vectors(self) -> list[AttackVector]:
@@ -113,6 +144,20 @@ class AttackLibrary:
     def categories(self) -> set[AttackCategory]:
         """All categories represented in the library."""
         return {v.category for v in self._vectors.values()}
+
+    @property
+    def load_error_count(self) -> int:
+        """Number of vectors or files that failed to load."""
+        return len(self._load_errors)
+
+    @property
+    def load_errors(self) -> list[tuple[str, Exception]]:
+        """List of ``(source, exception)`` pairs for each load failure.
+
+        *source* is a file path or vector ID depending on where the error
+        occurred.
+        """
+        return list(self._load_errors)
 
     def get_vector(self, vector_id: str) -> AttackVector | None:
         """Get a specific vector by ID.
@@ -140,9 +185,7 @@ class AttackLibrary:
             List of vectors targeting this phase within the coverage tier.
         """
         allowed = _COVERAGE_SEVERITIES[coverage]
-        return [
-            v for v in self._vectors.values() if v.target_phase == phase and v.severity in allowed
-        ]
+        return [v for v in self._by_phase.get(phase, []) if v.severity in allowed]
 
     def get_attacks_by_category(self, category: AttackCategory) -> list[AttackVector]:
         """Get all attack vectors in a specific category.
@@ -153,7 +196,7 @@ class AttackLibrary:
         Returns:
             List of vectors in this category.
         """
-        return [v for v in self._vectors.values() if v.category == category]
+        return list(self._by_category.get(category, []))
 
     def get_attacks_by_severity(self, severity: Severity) -> list[AttackVector]:
         """Get all attack vectors with a specific severity.
@@ -164,7 +207,7 @@ class AttackLibrary:
         Returns:
             List of vectors with this severity.
         """
-        return [v for v in self._vectors.values() if v.severity == severity]
+        return list(self._by_severity.get(severity, []))
 
     def get_attacks_by_tag(self, tag: str) -> list[AttackVector]:
         """Get all attack vectors with a specific tag.
@@ -188,6 +231,29 @@ class AttackLibrary:
         """
         return [v for v in self._vectors.values() if owasp_id in v.owasp_mapping]
 
+    def get_attacks_by_atlas(self, technique: AtlasTechnique) -> list[AttackVector]:
+        """Get all attack vectors mapped to a specific MITRE ATLAS technique.
+
+        Args:
+            technique: The ATLAS technique to filter by.
+
+        Returns:
+            List of vectors that exercise this technique.
+        """
+        return [v for v in self._vectors.values() if technique in v.atlas_mapping]
+
+    def lint_atlas_coverage(self) -> list[str]:
+        """Report attack vector IDs whose ``atlas_mapping`` is empty.
+
+        Used by the benchmark coverage script as a lint gate — after the
+        retro-mapping pass lands (spec 012, Phase 3), this list must be empty
+        in ``main``. Returns IDs in deterministic (sorted) order.
+
+        Returns:
+            Sorted list of vector IDs that lack an ATLAS mapping.
+        """
+        return sorted(v.id for v in self._vectors.values() if not v.atlas_mapping)
+
     def get_attacks_by_protocol(self, protocol: str) -> list[AttackVector]:
         """Get attack vectors applicable to a specific protocol.
 
@@ -205,6 +271,14 @@ class AttackLibrary:
             for v in self._vectors.values()
             if not v.protocol_filter or protocol in v.protocol_filter
         ]
+
+    def get_attacks_by_harm_category(self, category: HarmCategory) -> list[AttackVector]:
+        """Get attack vectors for a specific harm category.
+
+        Returns:
+            List of vectors with the specified harm category.
+        """
+        return [v for v in self._vectors.values() if v.harm_category == category]
 
     def search(
         self,
@@ -261,8 +335,10 @@ class AttackLibrary:
                 self._load_file(yaml_file)
             except (yaml.YAMLError, ValidationError, KeyError, OSError) as exc:
                 logger.warning("Failed to load attack vectors from %s: %s", yaml_file, exc)
-            except Exception:
+                self._load_errors.append((str(yaml_file), exc))
+            except Exception as exc:
                 logger.exception("Unexpected error loading attack vectors from %s", yaml_file)
+                self._load_errors.append((str(yaml_file), exc))
 
     def _load_file(self, filepath: Path) -> None:
         """Load attack vectors from a single YAML file.
@@ -271,7 +347,7 @@ class AttackLibrary:
             filepath: Path to the YAML file.
         """
         with filepath.open() as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
 
         if not data or "vectors" not in data:
             logger.warning("No vectors found in %s", filepath)
@@ -288,18 +364,22 @@ class AttackLibrary:
                     )
                 self._vectors[vector.id] = vector
             except (ValidationError, KeyError, ValueError) as exc:
+                vector_id = vector_data.get("id", "unknown")
                 logger.warning(
                     "Failed to parse vector '%s' from %s: %s",
-                    vector_data.get("id", "unknown"),
+                    vector_id,
                     filepath,
                     exc,
                 )
-            except Exception:
+                self._load_errors.append((str(vector_id), exc))
+            except Exception as exc:
+                vector_id = vector_data.get("id", "unknown")
                 logger.exception(
                     "Unexpected error parsing vector '%s' from %s",
-                    vector_data.get("id", "unknown"),
+                    vector_id,
                     filepath,
                 )
+                self._load_errors.append((str(vector_id), exc))
 
     @staticmethod
     def _parse_vector(data: dict[str, Any]) -> AttackVector:
@@ -333,6 +413,30 @@ class AttackLibrary:
             tags=data.get("tags", []),
             references=data.get("references", []),
             owasp_mapping=[OwaspLlmCategory(o) for o in data.get("owasp_mapping", [])],
+            atlas_mapping=[AtlasTechnique(t) for t in data.get("atlas_mapping", [])],
             protocol_filter=data.get("protocol_filter", []),
             tactic=data.get("tactic", "single"),
+            harm_category=HarmCategory(data["harm_category"])
+            if data.get("harm_category")
+            else None,
+            many_shot=ManyShotConfig(**data["many_shot"]) if data.get("many_shot") else None,
         )
+
+
+_INSTANCE: AttackLibrary | None = None
+
+
+def get_attack_library(**kwargs: Any) -> AttackLibrary:
+    """Return a cached ``AttackLibrary`` singleton for default configuration.
+
+    When called without arguments the same instance is returned on every
+    invocation, avoiding repeated YAML parsing.  Any keyword argument
+    forces a fresh instance so that custom directories or other overrides
+    are honoured.
+    """
+    global _INSTANCE
+    if kwargs:
+        return AttackLibrary(**kwargs)
+    if _INSTANCE is None:
+        _INSTANCE = AttackLibrary()
+    return _INSTANCE

@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from ziran.infrastructure.adapters.protocols import BaseProtocolHandler, ProtocolError
+from ziran.infrastructure.adapters.protocols import (
+    BaseProtocolHandler,
+    ProtocolError,
+    ProtocolResponse,
+)
 
 if TYPE_CHECKING:
     from ziran.domain.entities.target import TargetConfig
@@ -32,7 +36,7 @@ class RestProtocolHandler(BaseProtocolHandler):
         super().__init__(client, config)
         self._rest = config.rest or _default_rest()
 
-    async def send(self, message: str, **kwargs: Any) -> dict[str, Any]:
+    async def send(self, message: str, **kwargs: Any) -> ProtocolResponse:
         """Send a message via REST API.
 
         Args:
@@ -60,7 +64,11 @@ class RestProtocolHandler(BaseProtocolHandler):
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             msg = f"REST request failed with status {exc.response.status_code}"
-            raise ProtocolError(msg, status_code=exc.response.status_code) from exc
+            raise ProtocolError(
+                msg,
+                status_code=exc.response.status_code,
+                headers=dict(exc.response.headers),
+            ) from exc
         except httpx.HTTPError as exc:
             msg = f"REST request failed: {exc}"
             raise ProtocolError(msg) from exc

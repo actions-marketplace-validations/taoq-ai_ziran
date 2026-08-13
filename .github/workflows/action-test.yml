@@ -2,14 +2,14 @@ name: Action Self-Test
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "action.yml"
       - "ziran/**"
       - ".github/workflows/action-test.yml"
       - "tests/fixtures/sample_campaign_result.json"
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "action.yml"
       - "ziran/**"
@@ -25,7 +25,7 @@ jobs:
     name: "Test: ci command (offline gate)"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run ZIRAN action (ci mode)
         id: ziran
@@ -63,7 +63,7 @@ jobs:
     name: "Test: audit command"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run ZIRAN action (audit mode)
         id: ziran

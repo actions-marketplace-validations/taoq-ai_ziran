@@ -7,7 +7,6 @@ for scanning agents, discovering capabilities, and generating reports.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import sys
 from pathlib import Path
@@ -21,7 +20,9 @@ from rich.table import Table
 from ziran import __version__
 from ziran.application.agent_scanner.scanner import AgentScanner
 from ziran.application.attacks.library import AttackLibrary
-from ziran.domain.entities.attack import OwaspLlmCategory
+from ziran.application.factories import build_strategy, load_agent_adapter, load_remote_adapter
+from ziran.domain.entities.attack import AtlasTechnique, OwaspLlmCategory
+from ziran.domain.entities.defence import DefenceProfile
 from ziran.domain.entities.phase import CampaignResult, CoverageLevel, ScanPhase
 from ziran.infrastructure.logging.logger import setup_logging
 from ziran.infrastructure.storage.graph_storage import GraphStorage
@@ -85,7 +86,9 @@ def cli(ctx: click.Context, verbose: bool, log_file: str | None) -> None:
 @cli.command()
 @click.option(
     "--framework",
-    type=click.Choice(["langchain", "crewai", "bedrock", "agentcore"], case_sensitive=False),
+    type=click.Choice(
+        ["langchain", "crewai", "bedrock", "agentcore", "anthropic"], case_sensitive=False
+    ),
     default=None,
     help="Agent framework to test (for in-process scanning).",
 )
@@ -196,6 +199,10 @@ def cli(ctx: click.Context, verbose: bool, log_file: str | None) -> None:
             "whitespace",
             "mixed_case",
             "payload_split",
+            "pig_latin",
+            "reverse",
+            "word_shuffle",
+            "token_boundary",
         ],
         case_sensitive=False,
     ),
@@ -205,11 +212,48 @@ def cli(ctx: click.Context, verbose: bool, log_file: str | None) -> None:
     "Each encoding generates additional attack variants alongside the originals.",
 )
 @click.option(
+    "--quality-scoring",
+    is_flag=True,
+    default=False,
+    help="Enable StrongREJECT-style quality-aware jailbreak scoring. "
+    "Measures response specificity and convincingness (requires --llm-provider).",
+)
+@click.option(
+    "--utility-tasks",
+    type=click.Path(exists=True),
+    default=None,
+    help="YAML file with legitimate tasks for utility-under-attack measurement. "
+    "Runs tasks before and after the campaign to measure utility degradation.",
+)
+@click.option(
     "--otel",
     is_flag=True,
     default=False,
     help="Enable OpenTelemetry tracing (requires opentelemetry-sdk). "
     "Exports spans to the console by default.",
+)
+@click.option(
+    "--resume",
+    is_flag=True,
+    default=False,
+    help="Resume a previously interrupted campaign from the last checkpoint. "
+    "Reads checkpoint from the --output directory.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Validate configuration and show attack plan without executing. "
+    "Loads the adapter, discovers capabilities, and counts attack vectors.",
+)
+@click.option(
+    "--defence-profile",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to a YAML file declaring active defences on the target "
+    "(spec 012 US5). When declared, the campaign report carries a "
+    "'Declared Defences' section plus an evasion-rate metric (or "
+    "'not computable' when no declared defence is evaluable).",
 )
 def scan(
     framework: str | None,
@@ -229,7 +273,12 @@ def scan(
     strategy: str,
     streaming: bool,
     encoding: tuple[str, ...],
+    quality_scoring: bool,
+    utility_tasks: str | None,
     otel: bool,
+    resume: bool,
+    dry_run: bool,
+    defence_profile: str | None,
 ) -> None:
     """Run a security scan campaign against an AI agent.
 
@@ -309,16 +358,35 @@ def scan(
     if llm_provider or llm_model:
         config_table.add_row("LLM Provider", llm_provider or "litellm")
         config_table.add_row("LLM Model", llm_model or "gpt-4o")
+    if quality_scoring:
+        config_table.add_row("Quality Scoring", "enabled (StrongREJECT-style)")
+    if dry_run:
+        config_table.add_row("Dry Run", "enabled (no attacks will execute)")
     console.print(config_table)
     console.print()
+
+    # ── Config validation warnings ──────────────────────────────────
+    _warn_config_issues(
+        attack_timeout=attack_timeout,
+        phase_timeout=phase_timeout,
+        concurrency=concurrency,
+        strategy=strategy,
+        llm_provider=llm_provider,
+        encoding=encoding,
+    )
 
     # Load adapter
     try:
         if has_remote:
-            adapter = _load_remote_adapter(str(target), protocol)
+            adapter, config = load_remote_adapter(str(target), protocol)
+            console.print(f"[dim]Target: {config.url}[/dim]")
+            console.print(f"[dim]Protocol: {config.protocol.value}[/dim]")
+            if config.auth:
+                console.print(f"[dim]Auth: {config.auth.type.value}[/dim]")
+            console.print()
         else:
-            adapter = _load_agent_adapter(str(framework), str(agent_path))
-    except Exception as e:
+            adapter = load_agent_adapter(str(framework), str(agent_path))
+    except (ValueError, ImportError, FileNotFoundError, Exception) as e:
         console.print(f"[bold red]Error loading agent:[/bold red] {e}")
         sys.exit(1)
 
@@ -330,7 +398,25 @@ def scan(
         f"[dim]Loaded {attack_library.vector_count} attack vectors "
         f"across {len(attack_library.categories)} categories[/dim]"
     )
+    if attack_library.load_error_count > 0:
+        console.print(
+            f"[yellow]\u26a0 {attack_library.load_error_count} vectors failed to "
+            f"parse \u2014 use --verbose to see errors[/yellow]"
+        )
     console.print()
+
+    # ── Dry-run: show plan and exit without executing ───────────────
+    if dry_run:
+        _dry_run_summary(
+            adapter=adapter,
+            attack_library=attack_library,
+            coverage=coverage,
+            phases=phases,
+            has_remote=has_remote,
+            target=target,
+            protocol=protocol,
+        )
+        return
 
     # Parse phases
     phase_list: list[ScanPhase] | None = None
@@ -341,6 +427,7 @@ def scan(
     scanner_config: dict[str, Any] = {
         "attack_timeout": attack_timeout,
         "phase_timeout": phase_timeout,
+        "quality_scoring": quality_scoring,
     }
 
     # Initialize LLM client if provider/model specified
@@ -367,9 +454,32 @@ def scan(
     coverage_level = CoverageLevel(coverage.lower())
 
     # Build campaign strategy
-    campaign_strategy = _build_strategy(strategy, stop_on_critical, llm_client)
+    campaign_strategy = build_strategy(strategy, stop_on_critical, llm_client)
     if strategy != "fixed":
         console.print(f"[dim]Campaign strategy: {strategy}[/dim]")
+
+    # Load utility tasks if specified
+    loaded_utility_tasks = None
+    if utility_tasks:
+        from ziran.application.utility.measurer import load_utility_tasks
+
+        loaded_utility_tasks = load_utility_tasks(Path(utility_tasks))
+        console.print(f"[dim]Utility tasks: {len(loaded_utility_tasks)} tasks loaded[/dim]")
+
+    # Set up checkpoint manager (always enabled — used for resume and safety)
+    from ziran.application.agent_scanner.checkpoint import CheckpointManager
+
+    output_dir = Path(output)
+    checkpoint_mgr = CheckpointManager(output_dir)
+
+    if resume:
+        if checkpoint_mgr.exists():
+            console.print(f"[cyan]Resuming from checkpoint:[/cyan] {checkpoint_mgr.path}")
+        else:
+            console.print(
+                "[yellow]Warning:[/yellow] --resume specified but no checkpoint found "
+                f"in {output_dir}. Starting fresh."
+            )
 
     with console.status("[bold yellow]Running security scan campaign...[/bold yellow]"):
         result = asyncio.run(
@@ -381,6 +491,10 @@ def scan(
                 strategy=campaign_strategy,
                 streaming=streaming,
                 encoding=list(encoding) if encoding else None,
+                utility_tasks=loaded_utility_tasks,
+                checkpoint_manager=checkpoint_mgr,
+                resume_from_checkpoint=resume,
+                defence_profile=_load_defence_profile(defence_profile),
             )
         )
 
@@ -388,7 +502,6 @@ def scan(
     _display_results(result)
 
     # Save results
-    output_dir = Path(output)
     _save_results(result, scanner.graph, output_dir)
 
     console.print(f"\n[dim]Results saved to {output_dir}/[/dim]")
@@ -402,7 +515,9 @@ def scan(
 @cli.command()
 @click.option(
     "--framework",
-    type=click.Choice(["langchain", "crewai", "bedrock", "agentcore"], case_sensitive=False),
+    type=click.Choice(
+        ["langchain", "crewai", "bedrock", "agentcore", "anthropic"], case_sensitive=False
+    ),
     default=None,
     help="Agent framework (for in-process discovery).",
 )
@@ -458,7 +573,7 @@ def discover(
 
     try:
         if has_remote:
-            adapter = _load_remote_adapter(str(target), protocol)
+            adapter, _config = load_remote_adapter(str(target), protocol)
         else:
             if framework is None or agent_path is None:
                 console.print(
@@ -466,8 +581,8 @@ def discover(
                     "are required for in-process discovery."
                 )
                 sys.exit(1)
-            adapter = _load_agent_adapter(framework, agent_path)
-    except Exception as e:
+            adapter = load_agent_adapter(framework, agent_path)
+    except (ValueError, ImportError, FileNotFoundError, Exception) as e:
         console.print(f"[bold red]Error loading agent:[/bold red] {e}")
         sys.exit(1)
 
@@ -529,12 +644,20 @@ def discover(
     default=None,
     help="Filter vectors by OWASP LLM Top 10 category (e.g., LLM01).",
 )
+@click.option(
+    "--atlas",
+    "atlas_filter",
+    type=str,
+    default=None,
+    help="Filter vectors by MITRE ATLAS technique ID (e.g., AML.T0051).",
+)
 def library(
     list_all: bool,
     category: str | None,
     phase: str | None,
     custom_attacks: str | None,
     owasp_filter: str | None,
+    atlas_filter: str | None,
 ) -> None:
     """Browse the attack vector library.
 
@@ -544,6 +667,7 @@ def library(
         ziran library --category prompt_injection
         ziran library --phase reconnaissance
         ziran library --owasp LLM01
+        ziran library --atlas AML.T0051
     """
     custom_dirs = [Path(custom_attacks)] if custom_attacks else None
     lib = AttackLibrary(custom_dirs=custom_dirs)
@@ -557,6 +681,20 @@ def library(
     if owasp_filter:
         owasp_cat = OwaspLlmCategory(owasp_filter)
         vectors = [v for v in vectors if owasp_cat in v.owasp_mapping]
+    if atlas_filter:
+        try:
+            atlas_tech = AtlasTechnique(atlas_filter)
+        except ValueError:
+            import difflib
+
+            valid = [t.value for t in AtlasTechnique]
+            suggestions = difflib.get_close_matches(atlas_filter, valid, n=3)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise click.BadParameter(
+                f"Unknown ATLAS technique '{atlas_filter}'.{hint}",
+                param_hint="--atlas",
+            ) from None
+        vectors = [v for v in vectors if atlas_tech in v.atlas_mapping]
 
     if not vectors:
         console.print("[yellow]No matching attack vectors found.[/yellow]")
@@ -569,6 +707,7 @@ def library(
     table.add_column("Phase", style="blue")
     table.add_column("Severity", style="red")
     table.add_column("OWASP", style="yellow")
+    table.add_column("ATLAS", style="bright_cyan")
     table.add_column("Prompts", style="green", justify="right")
 
     for v in vectors:
@@ -580,6 +719,7 @@ def library(
         }.get(v.severity, "white")
 
         owasp_str = ", ".join(c.value for c in v.owasp_mapping) if v.owasp_mapping else "—"
+        atlas_str = ", ".join(t.value for t in v.atlas_mapping) if v.atlas_mapping else "—"
 
         table.add_row(
             v.id,
@@ -588,6 +728,7 @@ def library(
             v.target_phase.value,
             f"[{severity_style}]{v.severity}[/{severity_style}]",
             owasp_str,
+            atlas_str,
             str(v.prompt_count),
         )
 
@@ -962,6 +1103,107 @@ def _display_audit_report(report: Any) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# validate command (config validation)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.argument("target_config", type=click.Path(exists=True))
+@click.option(
+    "--protocol",
+    type=click.Choice(["rest", "openai", "mcp", "a2a", "browser", "auto"], case_sensitive=False),
+    default=None,
+    help="Override protocol type.",
+)
+def validate(target_config: str, protocol: str | None) -> None:
+    """Validate a target YAML configuration file.
+
+    Checks that the configuration file is well-formed, the target URL
+    is reachable, auth tokens resolve, and the protocol can be detected.
+
+    \b
+    Examples:
+        ziran validate ./target.yaml
+        ziran validate ./target.yaml --protocol openai
+    """
+    from ziran.domain.entities.target import TargetConfig, TargetConfigError, load_target_config
+
+    config_path = Path(target_config)
+    checks: list[tuple[str, bool, str]] = []  # (label, passed, detail)
+
+    # 1. Load and validate config (YAML parse + schema validation)
+    config: TargetConfig | None = None
+    try:
+        config = load_target_config(config_path)
+        checks.append(("YAML parse", True, "Configuration file is valid YAML"))
+        checks.append(("Config schema", True, f"URL: {config.url}"))
+    except TargetConfigError as e:
+        msg = str(e)
+        if "YAML" in msg or "parse" in msg.lower():
+            checks.append(("YAML parse", False, msg))
+        else:
+            checks.append(("YAML parse", True, "Configuration file is valid YAML"))
+            checks.append(("Config schema", False, msg))
+        _display_validation_results(checks)
+        return
+    except Exception as e:
+        checks.append(("Config load", False, str(e)))
+        _display_validation_results(checks)
+        return
+
+    # 2. Check protocol
+    effective_protocol = protocol or config.protocol.value
+    checks.append(("Protocol", True, effective_protocol))
+
+    # 3. Check auth token resolution
+    if config.auth:
+        env_var = config.auth.env_var
+        if env_var:
+            import os
+
+            resolved = os.environ.get(env_var)
+            if resolved:
+                checks.append(("Auth token", True, f"Resolved from env ${env_var}"))
+            else:
+                checks.append(("Auth token", False, f"Env var ${env_var} not set"))
+        elif config.auth.token:
+            checks.append(("Auth token", True, f"Type: {config.auth.type.value}"))
+        else:
+            checks.append(("Auth token", False, "Auth configured but no token provided"))
+    else:
+        checks.append(("Auth", True, "No auth configured (anonymous)"))
+
+    # 4. Check URL reachability (best-effort)
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(str(config.url), method="HEAD")
+        urllib.request.urlopen(req, timeout=5)
+        checks.append(("URL reachable", True, str(config.url)))
+    except Exception as e:
+        checks.append(("URL reachable", False, f"{e}"))
+
+    _display_validation_results(checks)
+
+
+def _display_validation_results(checks: list[tuple[str, bool, str]]) -> None:
+    """Render validation check results."""
+    console.print()
+    all_passed = all(passed for _, passed, _ in checks)
+
+    for label, passed, detail in checks:
+        icon = "[green]✓[/green]" if passed else "[red]✗[/red]"
+        console.print(f"  {icon} {label}: {detail}")
+
+    console.print()
+    if all_passed:
+        console.print("[green]✓ All checks passed — configuration is valid.[/green]")
+    else:
+        console.print("[red]✗ Some checks failed — review the errors above.[/red]")
+        sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # ci command (CI/CD quality gate)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -1145,205 +1387,106 @@ def _display_gate_result(gate: Any) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _load_agent_adapter(framework: str, agent_path: str) -> Any:
-    """Load an agent adapter for the specified framework.
+def _warn_config_issues(
+    *,
+    attack_timeout: float,
+    phase_timeout: float,
+    concurrency: int,
+    strategy: str,
+    llm_provider: str | None,
+    encoding: tuple[str, ...],
+) -> None:
+    """Detect and display warnings for contradictory or risky config options."""
+    warnings: list[str] = []
 
-    Dynamically imports the adapter module to keep framework
-    dependencies optional (lazy loading).
-
-    Args:
-        framework: Framework name (langchain, crewai, bedrock).
-        agent_path: Path to the agent code/config.
-
-    Returns:
-        Configured BaseAgentAdapter instance.
-
-    Raises:
-        click.ClickException: If the framework is not supported or import fails.
-    """
-    if framework == "langchain":
-        try:
-            from ziran.infrastructure.adapters.langchain_adapter import LangChainAdapter
-        except ImportError as e:
-            raise click.ClickException(
-                f"LangChain not installed. Run: uv sync --extra langchain\n{e}"
-            ) from e
-
-        # Load agent from path
-        agent_executor = _load_python_object(agent_path, "agent_executor")
-        return LangChainAdapter(agent_executor)
-
-    elif framework == "crewai":
-        try:
-            from ziran.infrastructure.adapters.crewai_adapter import CrewAIAdapter
-        except ImportError as e:
-            raise click.ClickException(
-                f"CrewAI not installed. Run: uv sync --extra crewai\n{e}"
-            ) from e
-
-        crew = _load_python_object(agent_path, "crew")
-        return CrewAIAdapter(crew)
-
-    elif framework == "bedrock":
-        try:
-            from ziran.infrastructure.adapters.bedrock_adapter import BedrockAdapter
-        except ImportError as e:
-            raise click.ClickException(
-                f"boto3 not installed. Run: uv sync --extra bedrock\n{e}"
-            ) from e
-
-        # Load Bedrock config from YAML or use agent_path as agent ID
-        bedrock_config = _load_bedrock_config(agent_path)
-        return BedrockAdapter(**bedrock_config)
-
-    elif framework == "agentcore":
-        try:
-            from ziran.infrastructure.adapters.agentcore_adapter import AgentCoreAdapter
-        except ImportError as e:
-            raise click.ClickException(
-                f"bedrock-agentcore not installed. Run: uv sync --extra agentcore\n{e}"
-            ) from e
-
-        entrypoint = _load_python_object(agent_path, "invoke")
-        # Try to also load the app object for capability discovery
-        app = None
-        with contextlib.suppress(click.ClickException):
-            app = _load_python_object(agent_path, "app")
-        return AgentCoreAdapter(entrypoint, app=app)
-
-    else:
-        raise click.ClickException(f"Unsupported framework: {framework}")
-
-
-def _load_bedrock_config(agent_path: str) -> dict[str, Any]:
-    """Load Bedrock agent configuration from a YAML file or agent ID string.
-
-    If ``agent_path`` ends with ``.yaml`` or ``.yml``, it's read as a
-    YAML config with keys ``agent_id``, ``agent_alias_id``,
-    ``region_name``, etc. Otherwise it's treated as a bare agent ID.
-
-    Args:
-        agent_path: Path to YAML config or a Bedrock agent ID.
-
-    Returns:
-        Dict of kwargs for ``BedrockAdapter.__init__``.
-    """
-    if agent_path.endswith((".yaml", ".yml")):
-        import yaml
-
-        path = Path(agent_path)
-        if not path.exists():
-            raise click.ClickException(f"Bedrock config file not found: {agent_path}")
-        try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except yaml.YAMLError as exc:
-            raise click.ClickException(f"Invalid YAML in Bedrock config: {exc}") from exc
-        if not isinstance(data, dict) or "agent_id" not in data:
-            raise click.ClickException("Bedrock config YAML must contain at least 'agent_id'")
-        return data
-    else:
-        return {"agent_id": agent_path}
-
-
-def _load_remote_adapter(target_path: str, protocol_override: str | None = None) -> Any:
-    """Load an agent adapter from a YAML target config.
-
-    Creates either a :class:`BrowserAgentAdapter` (for ``protocol: browser``)
-    or a :class:`HttpAgentAdapter` (for all other protocols).
-
-    Args:
-        target_path: Path to the YAML target configuration file.
-        protocol_override: Optional protocol to override the config value.
-
-    Returns:
-        Configured adapter instance.
-
-    Raises:
-        click.ClickException: If the config is invalid or can't be loaded.
-    """
-    try:
-        from ziran.domain.entities.target import ProtocolType, load_target_config
-    except ImportError as e:
-        raise click.ClickException(f"Failed to import target config components: {e}") from e
-
-    try:
-        config = load_target_config(Path(target_path))
-    except (FileNotFoundError, ValueError) as e:
-        raise click.ClickException(f"Failed to load target config from {target_path}: {e}") from e
-    except Exception as e:
-        raise click.ClickException(
-            f"Unexpected error loading target config from {target_path}: {e}"
-        ) from e
-
-    if protocol_override:
-        config.protocol = ProtocolType(protocol_override)
-
-    console.print(f"[dim]Target: {config.url}[/dim]")
-    console.print(f"[dim]Protocol: {config.protocol.value}[/dim]")
-    if config.auth:
-        console.print(f"[dim]Auth: {config.auth.type.value}[/dim]")
-    console.print()
-
-    if config.protocol == ProtocolType.BROWSER:
-        try:
-            from ziran.infrastructure.adapters.browser_adapter import BrowserAgentAdapter
-        except ImportError as e:
-            raise click.ClickException(
-                "Playwright is required for browser scanning. "
-                "Install with: pip install ziran[browser] && playwright install chromium\n"
-                f"{e}"
-            ) from e
-        return BrowserAgentAdapter(config)
-
-    from ziran.infrastructure.adapters.http_adapter import HttpAgentAdapter
-
-    return HttpAgentAdapter(config)
-
-
-def _load_python_object(filepath: str, object_name: str) -> Any:
-    """Load a Python object from a file by executing it.
-
-    Executes the file and extracts the named object from its namespace.
-
-    Args:
-        filepath: Path to the Python file.
-        object_name: Name of the object to extract.
-
-    Returns:
-        The extracted Python object.
-
-    Raises:
-        click.ClickException: If the file can't be loaded or the object isn't found.
-    """
-    import importlib.util
-    import sys
-
-    path = Path(filepath).resolve()
-
-    if not path.exists():
-        raise click.ClickException(f"File not found: {filepath}")
-
-    spec = importlib.util.spec_from_file_location("_ziran_target", str(path))
-    if spec is None or spec.loader is None:
-        raise click.ClickException(f"Could not load module from: {filepath}")
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["_ziran_target"] = module
-
-    try:
-        spec.loader.exec_module(module)
-    except Exception as e:
-        raise click.ClickException(f"Error executing {filepath}: {e}") from e
-
-    obj = getattr(module, object_name, None)
-    if obj is None:
-        available = [a for a in dir(module) if not a.startswith("_")]
-        raise click.ClickException(
-            f"Object '{object_name}' not found in {filepath}. "
-            f"Available objects: {', '.join(available)}"
+    if attack_timeout > phase_timeout:
+        warnings.append(
+            f"--attack-timeout ({attack_timeout}s) exceeds --phase-timeout "
+            f"({phase_timeout}s) — individual attacks may be killed before they finish."
         )
 
-    return obj
+    if concurrency > 50:
+        warnings.append(
+            f"--concurrency {concurrency} is very high — this is likely to trigger "
+            "rate limits on the target agent."
+        )
+
+    if strategy == "llm-adaptive" and llm_provider is None:
+        warnings.append(
+            "--strategy llm-adaptive requires --llm-provider to be configured. "
+            "The strategy will fall back to rule-based adaptation."
+        )
+
+    if encoding and strategy == "fixed":
+        # Not strictly contradictory, but encodings add significant volume
+        warnings.append(
+            f"--encoding specified ({len(encoding)} encodings) with --strategy fixed. "
+            "Consider using 'adaptive' strategy to manage the larger attack surface."
+        )
+
+    for w in warnings:
+        console.print(f"[yellow]⚠ Warning:[/yellow] {w}")
+    if warnings:
+        console.print()
+
+
+def _dry_run_summary(
+    *,
+    adapter: Any,
+    attack_library: Any,
+    coverage: str,
+    phases: tuple[str, ...],
+    has_remote: bool,
+    target: str | None,
+    protocol: str | None,
+) -> None:
+    """Run capability discovery and show attack plan without executing."""
+    # Discover capabilities
+    capabilities = asyncio.run(adapter.discover_capabilities())
+    dangerous_count = sum(1 for c in capabilities if c.dangerous) if capabilities else 0
+    total_caps = len(capabilities) if capabilities else 0
+
+    # Count vectors by coverage
+    coverage_level = CoverageLevel(coverage.lower())
+    vectors = attack_library.vectors
+    if coverage_level == CoverageLevel.ESSENTIAL:
+        vectors = [v for v in vectors if v.severity in ("critical",)]
+    elif coverage_level == CoverageLevel.STANDARD:
+        vectors = [v for v in vectors if v.severity in ("critical", "high")]
+    # comprehensive = all vectors
+
+    total_prompts = sum(v.prompt_count for v in vectors)
+
+    # Count phases
+    phase_count = len(phases) if phases else len({v.target_phase for v in vectors})
+
+    # Build summary table
+    summary = Table(title="Dry Run Summary", show_header=False)
+    summary.add_column("Key", style="cyan")
+    summary.add_column("Value", style="white")
+
+    if has_remote and target:
+        summary.add_row("Target", str(target))
+        if protocol:
+            summary.add_row("Protocol", protocol)
+    summary.add_row("Capabilities", f"{total_caps} discovered ({dangerous_count} dangerous)")
+    summary.add_row("Attack Vectors", f"{len(vectors)} ({coverage} coverage)")
+    summary.add_row("Total Prompts", str(total_prompts))
+    summary.add_row("Estimated Phases", str(phase_count))
+
+    console.print(summary)
+    console.print()
+    console.print("[green]✓ Configuration valid.[/green] Run without --dry-run to start.")
+
+
+def _load_defence_profile(path: str | None) -> DefenceProfile | None:
+    """Load a DefenceProfile from a YAML file; return None if no path given."""
+    if path is None:
+        return None
+    import yaml as _yaml
+
+    raw = _yaml.safe_load(Path(path).read_text())
+    return DefenceProfile.model_validate(raw)
 
 
 def _display_results(result: CampaignResult) -> None:
@@ -1363,7 +1506,7 @@ def _display_results(result: CampaignResult) -> None:
     summary_table.add_row("Target Agent", result.target_agent)
     summary_table.add_row("Phases Executed", str(len(result.phases_executed)))
     summary_table.add_row(
-        "Total Vulnerabilities",
+        "Prompt-level Vulnerabilities",
         f"[bold red]{result.total_vulnerabilities}[/bold red]"
         if result.total_vulnerabilities > 0
         else "[green]0[/green]",
@@ -1375,6 +1518,11 @@ def _display_results(result: CampaignResult) -> None:
         if result.dangerous_tool_chains
         else "[green]0[/green]",
     )
+    if result.critical_chain_count:
+        summary_table.add_row(
+            "Critical Compositions",
+            f"[bold red]{result.critical_chain_count}[/bold red]",
+        )
     summary_table.add_row("Final Trust Score", f"{result.final_trust_score:.2f}")
     summary_table.add_row(
         "Result",
@@ -1530,45 +1678,6 @@ def _save_results(
         poc_gen = PoCGenerator(output_dir=poc_dir)
         poc_paths = poc_gen.generate_all(result)
         console.print(f"  [dim]PoC artifacts: {len(poc_paths)} files in {poc_dir}/[/dim]")
-
-
-def _build_strategy(
-    strategy_name: str,
-    stop_on_critical: bool,
-    llm_client: Any | None = None,
-) -> Any:
-    """Build a campaign strategy from its CLI name.
-
-    Args:
-        strategy_name: One of 'fixed', 'adaptive', 'llm-adaptive'.
-        stop_on_critical: Whether to stop on critical findings.
-        llm_client: LLM client instance (required for 'llm-adaptive').
-
-    Returns:
-        A CampaignStrategy instance.
-    """
-    from ziran.application.strategies.adaptive import AdaptiveStrategy
-    from ziran.application.strategies.fixed import FixedStrategy
-
-    if strategy_name == "adaptive":
-        return AdaptiveStrategy(stop_on_critical=stop_on_critical)
-
-    if strategy_name == "llm-adaptive":
-        if llm_client is None:
-            console.print(
-                "[yellow]Warning:[/yellow] llm-adaptive strategy requires --llm-provider/--llm-model. "
-                "Falling back to adaptive strategy."
-            )
-            return AdaptiveStrategy(stop_on_critical=stop_on_critical)
-        from ziran.application.strategies.llm_adaptive import LLMAdaptiveStrategy
-
-        return LLMAdaptiveStrategy(
-            llm_client=llm_client,
-            stop_on_critical=stop_on_critical,
-        )
-
-    # Default: fixed
-    return FixedStrategy(stop_on_critical=stop_on_critical)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1729,7 +1838,9 @@ def multi_agent_scan(
 @cli.command()
 @click.option(
     "--framework",
-    type=click.Choice(["langchain", "crewai", "bedrock", "agentcore"], case_sensitive=False),
+    type=click.Choice(
+        ["langchain", "crewai", "bedrock", "agentcore", "anthropic"], case_sensitive=False
+    ),
     default=None,
     help="Agent framework to test (for in-process scanning).",
 )
@@ -2080,6 +2191,62 @@ def _display_session_results(session: Any) -> None:
             )
         console.print(findings_table)
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Web UI
+# ──────────────────────────────────────────────────────────────────────
+
+
+@cli.command("ui")
+@click.option("--host", default="127.0.0.1", help="Server bind address.")
+@click.option("--port", default=8484, type=int, help="Server port.")
+@click.option("--dev", is_flag=True, default=False, help="Development mode (CORS + auto-reload).")
+def ui_cmd(host: str, port: int, dev: bool) -> None:
+    """Launch the web dashboard."""
+    try:
+        import uvicorn
+
+        from ziran.interfaces.web.app import create_app
+    except ImportError as exc:
+        console.print("[red]Web UI dependencies not installed.[/red]")
+        console.print("Run: [bold]pip install ziran[ui][/bold]")
+        raise SystemExit(1) from exc
+
+    if dev:
+        console.print("[bold cyan]Ziran Web UI starting in development mode...[/bold cyan]")
+        console.print(f"Dashboard: [link]http://{host}:{port}[/link]")
+        console.print("CORS enabled for all origins.")
+        console.print("Auto-reload enabled.")
+    else:
+        console.print("[bold cyan]Ziran Web UI starting...[/bold cyan]")
+        console.print(f"Dashboard: [link]http://{host}:{port}[/link]")
+
+    console.print("Press Ctrl+C to stop.\n")
+
+    app = create_app(dev=dev)
+    uvicorn.run(app, host=host, port=port, reload=dev)
+
+
+def _register_v08_commands() -> None:
+    """Register v0.8 runtime-bridge CLI commands (lazy imports)."""
+    from ziran.interfaces.cli.analyze_traces import analyze_traces
+    from ziran.interfaces.cli.export_policy import export_policy
+    from ziran.interfaces.cli.watch_registry import watch_registry
+
+    cli.add_command(export_policy)
+    cli.add_command(analyze_traces)
+    cli.add_command(watch_registry)
+
+
+def _register_extra_commands() -> None:
+    """Register additional CLI commands (lazy imports)."""
+    from ziran.interfaces.cli.init_command import init
+
+    cli.add_command(init)
+
+
+_register_v08_commands()
+_register_extra_commands()
 
 if __name__ == "__main__":
     cli()

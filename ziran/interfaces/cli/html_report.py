@@ -16,75 +16,11 @@ import html
 import json
 from typing import Any
 
-# ── Node appearance by type ────────────────────────────────────────────
+from ziran.interfaces.graph_style.spec import GraphStyleSpec, load_graph_style
 
-_NODE_COLORS: dict[str, dict[str, str | dict[str, str]]] = {
-    "capability": {
-        "background": "#3b82f6",
-        "border": "#1d4ed8",
-        "highlight": {"background": "#60a5fa", "border": "#2563eb"},
-    },
-    "tool": {
-        "background": "#10b981",
-        "border": "#047857",
-        "highlight": {"background": "#34d399", "border": "#059669"},
-    },
-    "vulnerability": {
-        "background": "#ef4444",
-        "border": "#b91c1c",
-        "highlight": {"background": "#f87171", "border": "#dc2626"},
-    },
-    "data_source": {
-        "background": "#f59e0b",
-        "border": "#b45309",
-        "highlight": {"background": "#fbbf24", "border": "#d97706"},
-    },
-    "phase": {
-        "background": "#8b5cf6",
-        "border": "#6d28d9",
-        "highlight": {"background": "#a78bfa", "border": "#7c3aed"},
-    },
-    "agent_state": {
-        "background": "#6b7280",
-        "border": "#374151",
-        "highlight": {"background": "#9ca3af", "border": "#4b5563"},
-    },
-}
-
-_NODE_SHAPES: dict[str, str] = {
-    "capability": "dot",
-    "tool": "diamond",
-    "vulnerability": "triangle",
-    "data_source": "square",
-    "phase": "hexagon",
-    "agent_state": "ellipse",
-}
-
-_NODE_SIZES: dict[str, int] = {
-    "capability": 18,
-    "tool": 20,
-    "vulnerability": 25,
-    "data_source": 18,
-    "phase": 22,
-    "agent_state": 16,
-}
-
-_EDGE_COLORS: dict[str, str] = {
-    "uses_tool": "#3b82f6",
-    "accesses_data": "#f59e0b",
-    "trusts": "#10b981",
-    "enables": "#ef4444",
-    "can_chain_to": "#f97316",
-    "discovered_in": "#8b5cf6",
-    "exploits": "#dc2626",
-    "leads_to": "#ec4899",
-}
-
-_EDGE_DASHES: dict[str, bool] = {
-    "enables": True,
-    "can_chain_to": True,
-    "exploits": True,
-}
+# vis-network CDN version — kept in step with the web UI's ``vis-network``
+# dependency so both surfaces behave identically.
+_VIS_NETWORK_VERSION = "10.0.2"
 
 
 # ── Converter ──────────────────────────────────────────────────────────
@@ -93,61 +29,98 @@ _EDGE_DASHES: dict[str, bool] = {
 def graph_state_to_vis(graph_state: dict[str, Any]) -> dict[str, Any]:
     """Convert graph export_state() dict to vis-network nodes/edges.
 
+    Styling, sizing, severity/danger emphasis, attack-edge weighting, and
+    phase levels are all derived from the shared :mod:`ziran.interfaces.
+    graph_style` spec, so this mapping stays in lockstep with the web UI's
+    ``graphMapping.ts``.
+
     Args:
         graph_state: Dictionary from ``AttackKnowledgeGraph.export_state()``.
 
     Returns:
         ``{"nodes": [...], "edges": [...]}`` ready for vis-network DataSets.
     """
+    spec = load_graph_style()
     vis_nodes: list[dict[str, Any]] = []
     vis_edges: list[dict[str, Any]] = []
 
     for node in graph_state.get("nodes", []):
-        node_type = node.get("node_type", "agent_state")
-        colors = _NODE_COLORS.get(node_type, _NODE_COLORS["agent_state"])
-        label = node.get("name", node["id"])
-        if len(label) > 30:
-            label = label[:27] + "…"
-
-        vis_node: dict[str, Any] = {
-            "id": node["id"],
-            "label": label,
-            "title": _build_node_tooltip(node),
-            "shape": _NODE_SHAPES.get(node_type, "dot"),
-            "size": _NODE_SIZES.get(node_type, 16),
-            "color": colors,
-            "font": {"color": "#f8fafc", "size": 12},
-            "nodeType": node_type,
-        }
-        # Vulnerability nodes get a red border glow
-        if node_type == "vulnerability":
-            vis_node["borderWidth"] = 3
-            vis_node["shadow"] = {"enabled": True, "color": "rgba(239,68,68,0.5)", "size": 12}
-
-        vis_nodes.append(vis_node)
+        vis_nodes.append(_node_to_vis(node, spec))
 
     for idx, edge in enumerate(graph_state.get("edges", [])):
-        edge_type = edge.get("edge_type", "")
-        vis_edge: dict[str, Any] = {
-            "id": f"e{idx}",
-            "from": edge["source"],
-            "to": edge["target"],
-            "label": edge_type.replace("_", " "),
-            "arrows": "to",
-            "color": {"color": _EDGE_COLORS.get(edge_type, "#94a3b8"), "opacity": 0.8},
-            "font": {"size": 10, "color": "#94a3b8", "strokeWidth": 0, "align": "middle"},
-            "smooth": {"type": "curvedCW", "roundness": 0.15},
-            "edgeType": edge_type,
-        }
-        if _EDGE_DASHES.get(edge_type, False):
-            vis_edge["dashes"] = True
-        if edge_type in ("exploits", "enables"):
-            vis_edge["width"] = 2.5
-        else:
-            vis_edge["width"] = 1.5
-        vis_edges.append(vis_edge)
+        vis_edges.append(_edge_to_vis(idx, edge, spec))
 
     return {"nodes": vis_nodes, "edges": vis_edges}
+
+
+def _node_to_vis(node: dict[str, Any], spec: GraphStyleSpec) -> dict[str, Any]:
+    """Map a single graph node to a vis-network node using the shared spec."""
+    node_type = node.get("node_type", "agent_state")
+    style = spec.node_style(node_type)
+    label = node.get("name", node["id"])
+    if len(label) > 30:
+        label = label[:27] + "…"
+
+    # Severity overrides the border color when present (importance encoding).
+    severity = node.get("severity")
+    border = spec.severity_color(severity) or style.border
+    color: dict[str, Any] = {
+        "background": style.color,
+        "border": border,
+        "highlight": {"background": style.color, "border": border},
+    }
+
+    vis_node: dict[str, Any] = {
+        "id": node["id"],
+        "label": label,
+        "title": _build_node_tooltip(node),
+        "shape": style.shape,
+        "size": spec.node_size(node_type, node.get("centrality")),
+        "color": color,
+        "font": {"color": "#f8fafc", "size": 12},
+        "nodeType": node_type,
+        "severity": severity,
+        "level": spec.phase_level(node.get("phase")),
+        "phase": node.get("phase"),
+    }
+    # Dangerous capabilities get a distinct marker.
+    if node.get("dangerous"):
+        marker = spec.danger_marker
+        vis_node["borderWidth"] = marker.border_width
+        vis_node["color"]["border"] = marker.border_color
+        vis_node["shadow"] = {
+            "enabled": True,
+            "color": marker.shadow_color,
+            "size": marker.shadow_size,
+        }
+    elif severity:
+        vis_node["borderWidth"] = 3
+
+    return vis_node
+
+
+def _edge_to_vis(idx: int, edge: dict[str, Any], spec: GraphStyleSpec) -> dict[str, Any]:
+    """Map a single graph edge to a vis-network edge using the shared spec."""
+    edge_type = edge.get("edge_type", "")
+    style = spec.edge_style(edge_type)
+    vis_edge: dict[str, Any] = {
+        "id": f"e{idx}",
+        "from": edge["source"],
+        "to": edge["target"],
+        "label": edge_type.replace("_", " "),
+        "arrows": "to" if style.arrow else "",
+        "color": {"color": style.color, "opacity": 0.85},
+        "font": {"size": 10, "color": "#94a3b8", "strokeWidth": 0, "align": "middle"},
+        "smooth": {"type": "curvedCW", "roundness": 0.15},
+        "edgeType": edge_type,
+        "width": style.width,
+        "dashes": style.dashes,
+    }
+    # Attack-relevant edges get extra weight + emphasis.
+    if spec.is_attack_edge(edge_type):
+        vis_edge["width"] = max(style.width, 2.5)
+        vis_edge["color"]["opacity"] = 1.0
+    return vis_edge
 
 
 def _build_node_tooltip(node: dict[str, Any]) -> str:
@@ -196,9 +169,14 @@ def build_html_report(
     paths = critical_paths or result_data.get("critical_paths", [])
     stats = graph_state.get("stats", {})
 
+    # Per-phase snapshots power the offline timeline scrubber (spec 026 US3).
+    phase_states = _build_phase_states(result_data)
+
     campaign_id = result_data.get("campaign_id", "unknown")
     target_agent = result_data.get("target_agent", "unknown")
     total_vulns = result_data.get("total_vulnerabilities", 0)
+    critical_chains = result_data.get("critical_chain_count", 0)
+    total_chains = len(result_data.get("dangerous_tool_chains", []))
     trust_score = result_data.get("final_trust_score", 0)
     success = result_data.get("success", False)
     phases = result_data.get("phases_executed", [])
@@ -218,11 +196,31 @@ def build_html_report(
     attack_log_html = _build_attack_log_html(attack_results)
     # Build OWASP compliance HTML
     owasp_html = _build_owasp_html(attack_results, phases)
+    # Build ATLAS coverage HTML
+    atlas_html = _build_atlas_html(attack_results, phases)
+    # Build Declared Defences HTML (empty when no profile declared).
+    # The entire section wrapper is conditional so that reports with no
+    # profile are byte-identical to pre-spec-012 output (FR-017 / SC-005).
+    defence_html = _build_defence_html(result_data)
+    defence_html_section = (
+        (
+            "  <!-- Declared Defences (spec 012 US5) -->\n"
+            '  <div class="section">\n'
+            '    <div class="section-title">Declared Defences</div>\n'
+            f"    {defence_html}\n"
+            "  </div>\n"
+        )
+        if defence_html
+        else ""
+    )
 
     return _HTML_TEMPLATE.format(
+        vis_version=_VIS_NETWORK_VERSION,
         campaign_id=html.escape(campaign_id),
         target_agent=html.escape(target_agent),
         total_vulns=total_vulns,
+        total_chains=total_chains,
+        chain_class="danger" if critical_chains else ("orange" if total_chains else "accent"),
         trust_score=f"{trust_score:.2f}",
         trust_pct=int(trust_score * 100),
         success_label="VULNERABLE" if success else "PASSED",
@@ -241,10 +239,36 @@ def build_html_report(
         legend_html=legend_html,
         attack_log_html=attack_log_html,
         owasp_html=owasp_html,
+        atlas_html=atlas_html,
+        defence_html_section=defence_html_section,
         vis_nodes_json=json.dumps(vis_data["nodes"]),
         vis_edges_json=json.dumps(vis_data["edges"]),
         critical_paths_json=json.dumps(paths),
+        phase_states_json=json.dumps(phase_states),
     )
+
+
+def _build_phase_states(result_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build per-phase vis snapshots for the offline timeline scrubber.
+
+    Each completed phase that carries a graph snapshot becomes a labeled stop
+    ``{"label", "nodes", "edges"}``. Returns an empty list when no per-phase
+    snapshots exist (older runs), in which case the scrubber stays hidden.
+    """
+    states: list[dict[str, Any]] = []
+    for phase in result_data.get("phases_executed", []):
+        snapshot = phase.get("graph_state")
+        if not snapshot or not snapshot.get("nodes"):
+            continue
+        vis = graph_state_to_vis(snapshot)
+        states.append(
+            {
+                "label": str(phase.get("phase", "")),
+                "nodes": vis["nodes"],
+                "edges": vis["edges"],
+            }
+        )
+    return states
 
 
 # ── HTML fragment builders ─────────────────────────────────────────────
@@ -332,17 +356,25 @@ def _build_vulns_html(phases: list[dict[str, Any]]) -> str:
 
 
 def _build_legend_html() -> str:
+    """Build an interactive legend that doubles as a node-type filter.
+
+    Each node type renders as a checkbox swatch; toggling it shows/hides
+    nodes of that type in the graph (see ``toggleNodeType`` in the template).
+    Driven entirely by the shared graph-style spec.
+    """
+    spec = load_graph_style()
     parts: list[str] = ['<div class="legend-grid">']
-    for ntype, colors in _NODE_COLORS.items():
+    for ntype, style in spec.node_types.items():
         label = ntype.replace("_", " ").title()
-        bg = colors["background"]
-        shape_name = _NODE_SHAPES.get(ntype, "dot")
+        rounded = "50%" if style.shape in ("dot", "ellipse") else "3px"
         parts.append(
-            f'<div class="legend-item">'
-            f'  <span class="legend-swatch" style="background:{bg};'
-            f'    border-radius:{"50%" if shape_name in ("dot", "ellipse") else "3px"}"></span>'
+            f'<label class="legend-item" title="Toggle {html.escape(label)} nodes">'
+            f'  <input type="checkbox" class="legend-toggle" checked'
+            f'    data-node-type="{html.escape(ntype)}" onchange="toggleNodeType(this)">'
+            f'  <span class="legend-swatch" style="background:{style.color};'
+            f'    border-radius:{rounded}"></span>'
             f"  {html.escape(label)}"
-            f"</div>"
+            f"</label>"
         )
     parts.append("</div>")
     return "\n".join(parts)
@@ -425,6 +457,125 @@ def _build_owasp_html(
     return "\n".join(parts)
 
 
+def _build_defence_html(result_data: dict[str, Any]) -> str:
+    """Build the 'Declared Defences' section HTML for spec 012 US5.
+
+    Returns an empty string when no profile is declared or when the profile
+    has no defences — this keeps the rendered HTML byte-identical to
+    pre-spec-012 reports for the same target (FR-017 / SC-005).
+    """
+    profile = result_data.get("defence_profile")
+    if not profile:
+        return ""
+    defences = profile.get("defences") or []
+    if not defences:
+        return ""
+    evasion_rate = result_data.get("evasion_rate")
+
+    parts: list[str] = ['<table class="owasp-table">']
+    parts.append(
+        f'<caption style="caption-side:top;text-align:left;padding:6px 0;">'
+        f"<strong>Profile:</strong> {html.escape(profile.get('name', 'unknown'))}</caption>"
+    )
+    parts.append("<tr><th>Kind</th><th>Identifier</th><th>Evaluable</th></tr>")
+    for d in defences:
+        evaluable = "yes" if d.get("evaluable") else "no"
+        parts.append(
+            f"<tr><td>{html.escape(d.get('kind', ''))}</td>"
+            f"<td><code>{html.escape(d.get('identifier', ''))}</code></td>"
+            f"<td>{evaluable}</td></tr>"
+        )
+    parts.append("</table>")
+    if evasion_rate is not None:
+        parts.append(
+            f"<p><strong>Evasion rate:</strong> {evasion_rate:.1%} "
+            "(successful attacks that bypassed all evaluable defences).</p>"
+        )
+    else:
+        parts.append(
+            '<p class="muted"><strong>Evasion rate:</strong> not computable — '
+            "no declared defence is marked <code>evaluable: true</code> "
+            "in this release.</p>"
+        )
+    return "\n".join(parts)
+
+
+def _build_atlas_html(
+    attack_results: list[dict[str, Any]],
+    phases: list[dict[str, Any]],
+) -> str:
+    """Build a MITRE ATLAS coverage summary table grouped by tactic."""
+    from collections import Counter
+
+    from ziran.domain.entities.attack import (
+        AGENT_SPECIFIC_TECHNIQUES,
+        ATLAS_TACTIC_DESCRIPTIONS,
+        ATLAS_TECHNIQUE_DESCRIPTIONS,
+        ATLAS_TECHNIQUE_TO_TACTIC,
+        AtlasTactic,
+        AtlasTechnique,
+    )
+
+    findings: Counter[AtlasTechnique] = Counter()
+    tested: set[AtlasTechnique] = set()
+
+    for ar in attack_results:
+        for t_val in ar.get("atlas_mapping", []) or []:
+            try:
+                tech = AtlasTechnique(t_val)
+            except ValueError:
+                continue
+            tested.add(tech)
+            if ar.get("successful"):
+                findings[tech] += 1
+
+    for p in phases:
+        artifacts = p.get("artifacts", {})
+        vuln_ids = set(p.get("vulnerabilities_found", []))
+        for vid, art in artifacts.items():
+            for t_val in art.get("atlas_mapping", []) or []:
+                try:
+                    tech = AtlasTechnique(t_val)
+                except ValueError:
+                    continue
+                tested.add(tech)
+                if vid in vuln_ids:
+                    findings[tech] += 1
+
+    if not tested:
+        return '<p class="muted">No ATLAS mapping data available.</p>'
+
+    by_tactic: dict[AtlasTactic, list[AtlasTechnique]] = {}
+    for tech in sorted(tested, key=lambda t: t.value):
+        for tactic in ATLAS_TECHNIQUE_TO_TACTIC.get(tech, []):
+            by_tactic.setdefault(tactic, []).append(tech)
+
+    parts: list[str] = ['<table class="owasp-table">']
+    parts.append("<tr><th>Tactic</th><th>Technique</th><th>Status</th><th>Findings</th></tr>")
+    for tactic in AtlasTactic:
+        if tactic not in by_tactic:
+            continue
+        tactic_name = html.escape(ATLAS_TACTIC_DESCRIPTIONS.get(tactic, tactic.value))
+        for tech in by_tactic[tactic]:
+            desc = html.escape(ATLAS_TECHNIQUE_DESCRIPTIONS.get(tech, tech.value))
+            badge = " 🎯" if tech in AGENT_SPECIFIC_TECHNIQUES else ""
+            if tech in findings:
+                count = findings[tech]
+                status = '<span class="sev-badge sev-critical">FAIL</span>'
+                finding_text = f"{count} vuln{'s' if count != 1 else ''}"
+            else:
+                status = '<span class="sev-badge sev-ok">PASS</span>'
+                finding_text = "—"
+            parts.append(
+                f"<tr><td><strong>{tactic.value}</strong><br/><small>{tactic_name}</small></td>"
+                f"<td>{tech.value} — {desc}{badge}</td>"
+                f"<td>{status}</td><td>{finding_text}</td></tr>"
+            )
+    parts.append("</table>")
+    parts.append('<p class="muted">🎯 = agent-specific ATLAS technique (Oct 2025 release).</p>')
+    return "\n".join(parts)
+
+
 def _build_attack_log_html(attack_results: list[dict[str, Any]]) -> str:
     """Build collapsible attack-log cards grouped by phase."""
     if not attack_results:
@@ -444,6 +595,7 @@ def _build_attack_log_html(attack_results: list[dict[str, Any]]) -> str:
 
         for ar in results:
             successful = ar.get("successful", False)
+            vector_id = ar.get("vector_id", "")
             name = ar.get("vector_name", ar.get("vector_id", "unknown"))
             severity = ar.get("severity", "unknown")
             category = ar.get("category", "unknown").replace("_", " ")
@@ -469,8 +621,9 @@ def _build_attack_log_html(attack_results: list[dict[str, Any]]) -> str:
                 else "sev-low"
             )
 
+            anchor = f' id="report-attack-{html.escape(vector_id)}"' if vector_id else ""
             parts.append(
-                f'<details class="attack-card {result_cls}">'
+                f'<details class="attack-card {result_cls}"{anchor}>'
                 f'<summary class="attack-summary">'
                 f'  <span class="attack-icon">{icon}</span>'
                 f'  <span class="attack-name">{html.escape(name)}</span>'
@@ -480,9 +633,11 @@ def _build_attack_log_html(attack_results: list[dict[str, Any]]) -> str:
                 f'<div class="attack-body">'
             )
 
+            harm_cat = ar.get("harm_category")
+            harm_label = f" | Harm: {html.escape(harm_cat)}" if harm_cat else ""
             parts.append(
                 f'  <div class="attack-meta">'
-                f"    <span>Category: {html.escape(category)}</span>"
+                f"    <span>Category: {html.escape(category)}{harm_label}</span>"
                 f"  </div>"
             )
 
@@ -522,7 +677,7 @@ _HTML_TEMPLATE = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZIRAN Report — {campaign_id}</title>
-<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<script src="https://unpkg.com/vis-network@{vis_version}/standalone/umd/vis-network.min.js"></script>
 <style>
   :root {{
     --bg: #0f172a;
@@ -741,6 +896,13 @@ _HTML_TEMPLATE = """\
     gap: 5px;
     font-size: 0.75rem;
     color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }}
+  .legend-item input.legend-toggle {{
+    accent-color: var(--accent);
+    cursor: pointer;
+    margin: 0;
   }}
   .legend-swatch {{
     width: 12px;
@@ -926,6 +1088,46 @@ _HTML_TEMPLATE = """\
     background: var(--accent);
     border-color: var(--accent);
   }}
+  .graph-controls select {{
+    background: var(--bg-card);
+    border: 1px solid #475569;
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.78rem;
+  }}
+  /* Edge-type filter panel */
+  .graph-filters {{
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    max-width: 60%;
+    padding: 8px 12px;
+    background: rgba(30, 41, 59, 0.85);
+    border: 1px solid #334155;
+    border-radius: 8px;
+    z-index: 10;
+  }}
+  .graph-filters .filter-label {{
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--muted);
+    margin-right: 4px;
+  }}
+  .graph-filters .filter-item {{
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.72rem;
+    color: var(--muted);
+    cursor: pointer;
+  }}
+  .graph-filters .filter-item input {{ accent-color: var(--accent); cursor: pointer; margin: 0; }}
 </style>
 </head>
 <body>
@@ -946,8 +1148,12 @@ _HTML_TEMPLATE = """\
         <div class="metric-label">Result</div>
       </div>
       <div class="metric">
-        <div class="metric-value danger">{total_vulns}</div>
-        <div class="metric-label">Vulnerabilities</div>
+        <div class="metric-value {chain_class}">{total_chains}</div>
+        <div class="metric-label">Composition findings</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">{total_vulns}</div>
+        <div class="metric-label">Prompt-level vulns</div>
       </div>
       <div class="metric">
         <div class="metric-value orange">{num_paths}</div>
@@ -1020,6 +1226,14 @@ _HTML_TEMPLATE = """\
     {owasp_html}
   </div>
 
+  <!-- MITRE ATLAS Coverage -->
+  <div class="section">
+    <div class="section-title">MITRE ATLAS Coverage</div>
+    {atlas_html}
+  </div>
+
+  {defence_html_section}
+
   <!-- Attack Paths -->
   <div class="section">
     <div class="section-title">Critical Attack Paths</div>
@@ -1046,10 +1260,28 @@ _HTML_TEMPLATE = """\
 
   <!-- Controls -->
   <div class="graph-controls">
+    <button onclick="setLayout('force', this)" id="layoutForceBtn" class="active">Force</button>
+    <button onclick="setLayout('hierarchical', this)" id="layoutHierBtn">By Phase</button>
     <button onclick="fitGraph()">Fit View</button>
     <button onclick="togglePhysics(this)" id="physicsBtn">Pause Physics</button>
+    <select id="clusterSelect" onchange="setCluster(this.value)" title="Collapse nodes into groups">
+      <option value="none">No grouping</option>
+      <option value="phase">Group: phase</option>
+      <option value="nodeType">Group: type</option>
+    </select>
     <button onclick="resetHighlight()">Clear Highlight</button>
   </div>
+
+  <!-- Phase timeline scrubber (hidden when no per-phase snapshots) -->
+  <div class="graph-controls" id="phaseScrubber" style="display:none">
+    <span style="color:var(--muted);font-size:.8rem">Timeline</span>
+    <input type="range" id="phaseRange" min="0" max="0" step="1" value="0"
+           oninput="showPhase(this.value)" style="flex:1;min-width:160px">
+    <span id="phaseLabel" style="color:var(--text);font-size:.8rem"></span>
+  </div>
+
+  <!-- Edge-type filters (built from data) -->
+  <div class="graph-filters" id="edgeFilters"></div>
 </main>
 
 <script>
@@ -1057,6 +1289,7 @@ _HTML_TEMPLATE = """\
 const rawNodes = {vis_nodes_json};
 const rawEdges = {vis_edges_json};
 const criticalPaths = {critical_paths_json};
+const phaseStates = {phase_states_json};
 
 // ── Initialise vis-network ────────────────────────────────────────
 const nodes = new vis.DataSet(rawNodes);
@@ -1095,12 +1328,134 @@ const options = {{
 
 const network = new vis.Network(container, data, options);
 
-// ── Click handler — show node detail ──────────────────────────────
+// ── Layout modes (force-directed ↔ hierarchical by phase) ─────────
+let currentLayout = 'force';
+function setLayout(mode, btn) {{
+  currentLayout = mode;
+  document.querySelectorAll('#layoutForceBtn, #layoutHierBtn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  if (mode === 'hierarchical') {{
+    network.setOptions({{
+      layout: {{ hierarchical: {{
+        enabled: true, direction: 'LR', sortMethod: 'directed',
+        levelSeparation: 220, nodeSpacing: 110,
+      }} }},
+      physics: {{ enabled: false }},
+    }});
+    physicsEnabled = false;
+    const pb = document.getElementById('physicsBtn');
+    if (pb) {{ pb.textContent = 'Resume Physics'; pb.classList.add('active'); }}
+  }} else {{
+    network.setOptions({{
+      layout: {{ hierarchical: {{ enabled: false }} }},
+      physics: {{ enabled: true }},
+    }});
+    physicsEnabled = true;
+    const pb = document.getElementById('physicsBtn');
+    if (pb) {{ pb.textContent = 'Pause Physics'; pb.classList.remove('active'); }}
+  }}
+  network.fit({{ animation: {{ duration: 400, easingFunction: 'easeInOutQuad' }} }});
+}}
+
+// ── Filtering (legend doubles as a node-type filter) ───────────────
+const hiddenNodeTypes = new Set();
+const hiddenEdgeTypes = new Set();
+
+function applyFilters() {{
+  nodes.update(rawNodes.map(n => ({{ id: n.id, hidden: hiddenNodeTypes.has(n.nodeType) }})));
+  edges.update(rawEdges.map(e => ({{ id: e.id, hidden: hiddenEdgeTypes.has(e.edgeType) }})));
+}}
+
+function toggleNodeType(cb) {{
+  const t = cb.getAttribute('data-node-type');
+  if (cb.checked) hiddenNodeTypes.delete(t); else hiddenNodeTypes.add(t);
+  applyFilters();
+}}
+
+function toggleEdgeType(cb) {{
+  const t = cb.getAttribute('data-edge-type');
+  if (cb.checked) hiddenEdgeTypes.delete(t); else hiddenEdgeTypes.add(t);
+  applyFilters();
+}}
+
+// Build edge-type filter checkboxes from the edge types actually present.
+(function buildEdgeFilters() {{
+  const panel = document.getElementById('edgeFilters');
+  if (!panel) return;
+  const present = [...new Set(rawEdges.map(e => e.edgeType).filter(Boolean))].sort();
+  if (!present.length) return;
+  panel.innerHTML = '<span class="filter-label">Edges:</span>';
+  present.forEach(t => {{
+    const id = 'edgef_' + t;
+    const label = document.createElement('label');
+    label.className = 'filter-item';
+    label.innerHTML = '<input type="checkbox" checked data-edge-type="' + escHtml(t) +
+      '" onchange="toggleEdgeType(this)" id="' + id + '"> ' + escHtml(t.replace(/_/g, ' '));
+    panel.appendChild(label);
+  }});
+}})();
+
+// ── Clustering (collapse nodes into labeled super-nodes) ──────────
+let clusterIds = [];
+function resetClusters() {{
+  clusterIds.forEach(id => {{ try {{ network.openCluster(id); }} catch (e) {{}} }});
+  clusterIds = [];
+}}
+function setCluster(mode) {{
+  resetClusters();
+  if (mode === 'none') return;
+  const counts = {{}};
+  rawNodes.forEach(n => {{ const k = n[mode]; if (k) counts[k] = (counts[k] || 0) + 1; }});
+  Object.keys(counts).forEach(key => {{
+    if (counts[key] < 2) return;
+    const id = 'cluster:' + mode + ':' + key;
+    network.cluster({{
+      joinCondition: o => o[mode] === key,
+      clusterNodeProperties: {{
+        id: id,
+        label: String(key).replace(/_/g, ' ') + ' (' + counts[key] + ')',
+        shape: 'database', color: '#475569',
+        font: {{ color: '#f8fafc', size: 13 }}, borderWidth: 2,
+      }},
+    }});
+    clusterIds.push(id);
+  }});
+}}
+
+// ── Phase timeline scrubber (offline temporal replay) ────────────
+(function initScrubber() {{
+  if (!phaseStates || phaseStates.length < 2) return;
+  const range = document.getElementById('phaseRange');
+  range.max = String(phaseStates.length - 1);
+  range.value = String(phaseStates.length - 1);
+  updatePhaseLabel(phaseStates.length - 1);
+  document.getElementById('phaseScrubber').style.display = 'flex';
+}})();
+
+function updatePhaseLabel(idx) {{
+  const state = phaseStates[idx];
+  document.getElementById('phaseLabel').textContent =
+    (idx + 1) + '/' + phaseStates.length + ' · ' + String(state.label).replace(/_/g, ' ');
+}}
+
+function showPhase(i) {{
+  const idx = Number(i);
+  const state = phaseStates[idx];
+  if (!state) return;
+  resetClusters();
+  nodes.clear(); nodes.add(state.nodes);
+  edges.clear(); edges.add(state.edges);
+  updatePhaseLabel(idx);
+}}
+
+// ── Click handler — show node detail + cross-link to attack log ───
 network.on('click', function(params) {{
   if (params.nodes.length > 0) {{
     const nodeId = params.nodes[0];
     const node = nodes.get(nodeId);
     showDetail(node);
+    const card = document.getElementById('report-attack-' + nodeId);
+    if (card) {{ card.open = true; card.scrollIntoView({{ behavior: 'smooth', block: 'center' }}); }}
   }} else {{
     closeDetail();
   }}

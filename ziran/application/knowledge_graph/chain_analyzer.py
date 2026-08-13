@@ -11,6 +11,7 @@ attacker to exfiltrate local file contents to an external server.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -113,9 +114,19 @@ class ToolChainAnalyzer:
         chains: list[DangerousChain] = []
         _chain_span = _tracer.start_span("ziran.chain_analysis")
 
-        chains.extend(self._find_direct_chains())
-        chains.extend(self._find_indirect_chains(max_hops=3))
-        chains.extend(self._find_chain_cycles())
+        # Cache tool nodes and pattern matches for the duration of this call
+        tool_nodes = self._get_tool_nodes()
+        pattern_cache: dict[tuple[str, str], ChainPatternInfo | None] = {}
+
+        # Compute centrality once for all chains
+        centrality: dict[str, float] = {}
+        if self.graph.graph.number_of_nodes() > 1:
+            with contextlib.suppress(nx.NetworkXError):
+                centrality = nx.betweenness_centrality(self.graph.graph)
+
+        chains.extend(self._find_direct_chains(tool_nodes, pattern_cache))
+        chains.extend(self._find_indirect_chains(tool_nodes, pattern_cache, max_hops=3))
+        chains.extend(self._find_chain_cycles(tool_nodes, pattern_cache))
 
         # Deduplicate by (tools tuple, vulnerability_type)
         seen: set[tuple[tuple[str, ...], str]] = set()
@@ -124,7 +135,7 @@ class ToolChainAnalyzer:
             key = (tuple(chain.tools), chain.vulnerability_type)
             if key not in seen:
                 seen.add(key)
-                chain.risk_score = self._calculate_risk_score(chain)
+                chain.risk_score = self._calculate_risk_score(chain, centrality)
                 unique.append(chain)
 
         # Sort by risk score descending, then by risk_level severity
@@ -150,10 +161,13 @@ class ToolChainAnalyzer:
 
     # ── Direct chains ──────────────────────────────────────────────
 
-    def _find_direct_chains(self) -> list[DangerousChain]:
+    def _find_direct_chains(
+        self,
+        tool_nodes: list[tuple[str, dict[str, Any]]],
+        pattern_cache: dict[tuple[str, str], ChainPatternInfo | None],
+    ) -> list[DangerousChain]:
         """Find dangerous 2-tool chains where A → B exists in the graph."""
         chains: list[DangerousChain] = []
-        tool_nodes = self._get_tool_nodes()
 
         for source_id, _source_data in tool_nodes:
             for target_id, _target_data in tool_nodes:
@@ -162,7 +176,7 @@ class ToolChainAnalyzer:
                 if not self.graph.graph.has_edge(source_id, target_id):
                     continue
 
-                pattern_info = self._match_pattern(source_id, target_id)
+                pattern_info = self._match_pattern(source_id, target_id, pattern_cache)
                 if pattern_info is not None:
                     chains.append(
                         DangerousChain(
@@ -181,69 +195,105 @@ class ToolChainAnalyzer:
 
     # ── Indirect chains ────────────────────────────────────────────
 
-    def _find_indirect_chains(self, max_hops: int = 3) -> list[DangerousChain]:
+    def _find_indirect_chains(
+        self,
+        tool_nodes: list[tuple[str, dict[str, Any]]],
+        pattern_cache: dict[tuple[str, str], ChainPatternInfo | None],
+        max_hops: int = 3,
+    ) -> list[DangerousChain]:
         """Find dangerous chains A → X → … → B via intermediate nodes."""
         chains: list[DangerousChain] = []
-        tool_nodes = self._get_tool_nodes()
 
-        for source_id, _ in tool_nodes:
-            for target_id, _ in tool_nodes:
-                if source_id == target_id:
+        # Pre-compute keywords and lowercase forms for all tool IDs so
+        # that pattern matching can quickly determine candidate pairs.
+        tool_ids = [tid for tid, _ in tool_nodes]
+        tool_lower = {tid: tid.lower() for tid in tool_ids}
+        tool_kw = {tid: self._to_keywords(tid) for tid in tool_ids}
+
+        # Build candidate (source, target) pairs by checking which tools
+        # could match each pattern role.  This avoids the full O(T²) loop
+        # for patterns that only apply to a small subset of tools.
+        candidate_pairs: dict[tuple[str, str], ChainPatternInfo] = {}
+        for (pat_src, pat_tgt), info in self._patterns.items():
+            src_matches = [
+                tid
+                for tid in tool_ids
+                if self._pattern_matches(pat_src, tool_lower[tid], tool_kw[tid])
+            ]
+            tgt_matches = [
+                tid
+                for tid in tool_ids
+                if self._pattern_matches(pat_tgt, tool_lower[tid], tool_kw[tid])
+            ]
+            for s in src_matches:
+                for t in tgt_matches:
+                    if s != t and (s, t) not in candidate_pairs:
+                        candidate_pairs[(s, t)] = info
+
+        for (source_id, target_id), pattern_info in candidate_pairs.items():
+            # Skip if there's already a direct edge (handled above)
+            if self.graph.graph.has_edge(source_id, target_id):
+                continue
+
+            # Fast reachability check before expensive path enumeration
+            try:
+                if not nx.has_path(self.graph.graph, source_id, target_id):
                     continue
+            except (nx.NetworkXError, nx.NodeNotFound):
+                continue
 
-                # Skip if there's already a direct edge (handled above)
-                if self.graph.graph.has_edge(source_id, target_id):
-                    continue
+            # Populate the pattern cache for consistency
+            pattern_cache.setdefault((source_id, target_id), pattern_info)
 
-                pattern_info = self._match_pattern(source_id, target_id)
-                if pattern_info is None:
-                    continue
-
-                # Search for paths via intermediate nodes
-                try:
-                    paths = list(
-                        nx.all_simple_paths(
-                            self.graph.graph,
-                            source_id,
-                            target_id,
-                            cutoff=max_hops,
-                        )
+            # Search for paths via intermediate nodes
+            try:
+                paths = list(
+                    nx.all_simple_paths(
+                        self.graph.graph,
+                        source_id,
+                        target_id,
+                        cutoff=max_hops,
                     )
-                except (nx.NetworkXError, nx.NodeNotFound):
-                    continue
+                )
+            except (nx.NetworkXError, nx.NodeNotFound):
+                continue
 
-                for path in paths:
-                    if len(path) < 3:
-                        continue  # must have at least 1 intermediate
+            for path in paths:
+                if len(path) < 3:
+                    continue  # must have at least 1 intermediate
 
-                    chains.append(
-                        DangerousChain(
-                            tools=[source_id, target_id],
-                            risk_level=pattern_info["risk"],
-                            vulnerability_type=pattern_info["type"],
-                            exploit_description=(
-                                f"{pattern_info['description']} "
-                                f"(via {len(path) - 2} intermediate node(s))"
-                            ),
-                            remediation=pattern_info.get("remediation", ""),
-                            graph_path=path,
-                            chain_type="indirect",
-                            evidence={
-                                "full_path": path,
-                                "intermediate_nodes": path[1:-1],
-                                "hops": len(path) - 1,
-                            },
-                        )
+                chains.append(
+                    DangerousChain(
+                        tools=[source_id, target_id],
+                        risk_level=pattern_info["risk"],
+                        vulnerability_type=pattern_info["type"],
+                        exploit_description=(
+                            f"{pattern_info['description']} "
+                            f"(via {len(path) - 2} intermediate node(s))"
+                        ),
+                        remediation=pattern_info.get("remediation", ""),
+                        graph_path=path,
+                        chain_type="indirect",
+                        evidence={
+                            "full_path": path,
+                            "intermediate_nodes": path[1:-1],
+                            "hops": len(path) - 1,
+                        },
                     )
+                )
 
         return chains
 
     # ── Cycle detection ────────────────────────────────────────────
 
-    def _find_chain_cycles(self) -> list[DangerousChain]:
+    def _find_chain_cycles(
+        self,
+        tool_nodes: list[tuple[str, dict[str, Any]]],
+        pattern_cache: dict[tuple[str, str], ChainPatternInfo | None],
+    ) -> list[DangerousChain]:
         """Find cycles in the graph that involve dangerous tool pairs."""
         chains: list[DangerousChain] = []
-        tool_ids = {nid for nid, _ in self._get_tool_nodes()}
+        tool_ids = {nid for nid, _ in tool_nodes}
 
         try:
             cycles: list[list[str]] = list(nx.simple_cycles(self.graph.graph))
@@ -263,7 +313,7 @@ class ToolChainAnalyzer:
                 if src not in tool_ids or tgt not in tool_ids:
                     continue
 
-                pattern_info = self._match_pattern(src, tgt)
+                pattern_info = self._match_pattern(src, tgt, pattern_cache)
                 if pattern_info is not None:
                     chains.append(
                         DangerousChain(
@@ -288,27 +338,30 @@ class ToolChainAnalyzer:
 
     # ── Scoring ────────────────────────────────────────────────────
 
-    def _calculate_risk_score(self, chain: DangerousChain) -> float:
+    def _calculate_risk_score(
+        self,
+        chain: DangerousChain,
+        centrality: dict[str, float],
+    ) -> float:
         """Calculate a 0.0-1.0 risk score for a chain.
 
         Factors:
         - Base weight from risk level (critical=1.0 … low=0.25).
         - Multiplier from chain type (direct > cycle > indirect).
         - Bonus for chains involving nodes with high graph centrality.
+
+        Args:
+            chain: The chain to score.
+            centrality: Pre-computed betweenness centrality dict.
         """
         base = _RISK_WEIGHTS.get(chain.risk_level, 0.5)
         multiplier = _CHAIN_TYPE_MULTIPLIERS.get(chain.chain_type, 1.0)
 
         # Centrality bonus: if any tool in the chain is a high-centrality node
         centrality_bonus = 0.0
-        if self.graph.graph.number_of_nodes() > 1:
-            try:
-                bc: dict[str, float] = nx.betweenness_centrality(self.graph.graph)
-                for tool in chain.tools:
-                    if tool in bc:
-                        centrality_bonus = max(centrality_bonus, bc[tool] * 0.15)
-            except nx.NetworkXError:
-                pass
+        for tool in chain.tools:
+            if tool in centrality:
+                centrality_bonus = max(centrality_bonus, centrality[tool] * 0.15)
 
         score = base * multiplier + centrality_bonus
         return min(1.0, round(score, 3))
@@ -323,21 +376,74 @@ class ToolChainAnalyzer:
             if d.get("node_type") in (NodeType.TOOL, NodeType.CAPABILITY)
         ]
 
+    @staticmethod
+    def _to_keywords(tool_id: str) -> set[str]:
+        """Extract keywords from a tool ID by splitting on separators.
+
+        ``"mcp_read_file"`` → ``{"mcp", "read", "file"}``
+        ``"requests_get"``  → ``{"requests", "get"}``
+        """
+        import re as _re
+
+        tokens = _re.split(r"[_\-\s./]+", tool_id.lower())
+        return {t for t in tokens if len(t) > 1}
+
     def _match_pattern(
         self,
         source_id: str,
         target_id: str,
+        cache: dict[tuple[str, str], ChainPatternInfo | None],
     ) -> ChainPatternInfo | None:
         """Check whether a (source, target) pair matches any dangerous pattern.
 
-        Uses *substring* matching so that ``"tool_read_file"`` matches
-        the pattern key ``"read_file"``.
+        Uses two matching strategies (first match wins):
+
+        1. **Substring** — ``"read_file"`` matches ``"tool_read_file"``.
+        2. **Keyword overlap** — pattern ``"http_request"`` matches tool
+           ``"requests_get"`` because they share the keyword ``"request"``
+           (via substring within keywords).
+
+        Results are memoized in *cache* so the same pair is only checked once.
         """
+        key = (source_id, target_id)
+        if key in cache:
+            return cache[key]
+
         source_lower = source_id.lower()
         target_lower = target_id.lower()
+        source_kw = self._to_keywords(source_id)
+        target_kw = self._to_keywords(target_id)
 
         for (pat_src, pat_tgt), info in self._patterns.items():
-            if pat_src in source_lower and pat_tgt in target_lower:
+            src_match = self._pattern_matches(pat_src, source_lower, source_kw)
+            tgt_match = self._pattern_matches(pat_tgt, target_lower, target_kw)
+            if src_match and tgt_match:
+                cache[key] = info
                 return info
 
+        cache[key] = None
         return None
+
+    @staticmethod
+    def _pattern_matches(pattern: str, tool_lower: str, tool_kw: set[str]) -> bool:
+        """Check if a single pattern string matches a tool ID.
+
+        Strategies:
+        1. Substring: ``pattern in tool_lower``
+        2. Keyword overlap: every keyword in the pattern appears in at
+           least one tool keyword (via substring containment).
+        """
+        # Strategy 1: direct substring
+        if pattern in tool_lower:
+            return True
+
+        # Strategy 2: keyword overlap — split pattern into keywords,
+        # check each pattern keyword is contained in some tool keyword
+        import re as _re
+
+        pat_kw = _re.split(r"[_\-\s./]+", pattern.lower())
+        pat_kw = [k for k in pat_kw if len(k) > 1]
+        if not pat_kw:
+            return False
+
+        return all(any(pk in tk or tk in pk for tk in tool_kw) for pk in pat_kw)

@@ -17,7 +17,11 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from ziran.domain.entities.streaming import AgentResponseChunk
-from ziran.infrastructure.adapters.protocols import BaseProtocolHandler, ProtocolError
+from ziran.infrastructure.adapters.protocols import (
+    BaseProtocolHandler,
+    ProtocolError,
+    ProtocolResponse,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -109,7 +113,7 @@ class SSEProtocolHandler(BaseProtocolHandler):
 
     # ── BaseProtocolHandler Implementation ───────────────────────
 
-    async def send(self, message: str, **kwargs: Any) -> dict[str, Any]:
+    async def send(self, message: str, **kwargs: Any) -> ProtocolResponse:
         """Non-streaming send (accumulates full SSE stream into one response).
 
         This fallback collects all SSE chunks and returns the full response,
@@ -168,7 +172,9 @@ class SSEProtocolHandler(BaseProtocolHandler):
                 if response.status_code >= 400:
                     await response.aread()
                     msg = f"SSE request failed with status {response.status_code}"
-                    raise ProtocolError(msg, status_code=response.status_code)
+                    raise ProtocolError(
+                        msg, status_code=response.status_code, headers=dict(response.headers)
+                    )
 
                 accumulated_tool_calls: dict[int, dict[str, Any]] = {}
                 async for chunk in self._parse_sse_stream(response, accumulated_tool_calls):

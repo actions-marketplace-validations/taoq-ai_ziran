@@ -1,6 +1,10 @@
 # Roadmap
 
-## Released
+Priorities shift as the landscape changes. This page tracks **themes** we're actively investing in — not fixed version schedules. For what's currently in flight, see the [active milestones on GitHub](https://github.com/taoq-ai/ziran/milestones). For commercial / hosted-platform work, see the [ZIRAN Cloud planning notes](#ziran-cloud).
+
+---
+
+## Recently Delivered
 
 ### v0.1 — Foundation
 
@@ -20,87 +24,203 @@
 - :white_check_mark: Policy engine with configurable rules
 - :white_check_mark: CI/CD quality gate with SARIF output
 - :white_check_mark: Amazon Bedrock adapter
-- :white_check_mark: Expanded attack library (137 vectors across 9 files)
-- :white_check_mark: OWASP LLM Top 10 mapping for all vectors
+- :white_check_mark: Expanded attack library with OWASP LLM Top 10 mapping
 
 ### v0.3 — Remote Scanning
 
-- :white_check_mark: Remote agent scanning over HTTPS
-- :white_check_mark: REST protocol handler (generic HTTP APIs)
-- :white_check_mark: OpenAI-compatible protocol handler
-- :white_check_mark: MCP (Model Context Protocol) handler
-- :white_check_mark: A2A (Agent-to-Agent) protocol handler
-- :white_check_mark: Auto-protocol detection
+- :white_check_mark: Remote agent scanning over HTTPS (REST, OpenAI, MCP, A2A handlers with auto-detection)
 - :white_check_mark: Target YAML configuration with auth, TLS, retry
 - :white_check_mark: GitHub Action (`taoq-ai/ziran@v0`)
-- :white_check_mark: 11 dedicated A2A attack vectors
-- :white_check_mark: 15 runnable examples
 
 ### v0.4 — Multi-Vendor & LLM Backbone
 
 - :white_check_mark: Multi-vendor LLM support via LiteLLM (OpenAI, Anthropic, AWS Bedrock, Google, and more)
 - :white_check_mark: LLM-as-a-Judge detection for nuanced semantic analysis
 - :white_check_mark: Amazon Bedrock Agent and AgentCore adapters
-- :white_check_mark: Dependency capping and compatibility hardening
 
 ### v0.5 — Adaptive Intelligence
 
-- :white_check_mark: **Streaming support** — SSE and WebSocket protocol handlers for real-time attack monitoring
-- :white_check_mark: **Multi-agent coordination** — Topology discovery, individual and cross-agent scanning for supervisor, router, peer-to-peer, hierarchical, and pipeline architectures
-- :white_check_mark: **Adaptive campaigns** — Three execution strategies: fixed (sequential), adaptive (rule-based), and LLM-adaptive (LLM-driven phase orchestration)
-- :white_check_mark: **Campaign strategy protocol** — Extensible interface for custom campaign strategies
-- :white_check_mark: **327 multi-agent attack vectors** — Cross-agent prompt injection, delegation chain manipulation, shared memory poisoning
-- :white_check_mark: **18 runnable examples** — Including multi-agent, streaming, and adaptive campaign demos
+- :white_check_mark: Streaming support (SSE, WebSocket)
+- :white_check_mark: Multi-agent coordination — topology discovery, cross-agent scanning
+- :white_check_mark: Adaptive campaign strategies — fixed, rule-based, and LLM-driven phase orchestration
+- :white_check_mark: 327 multi-agent attack vectors covering cross-agent injection, delegation-chain manipulation, shared-memory poisoning
 
-### v0.6 — Pentesting Agent
+### v0.6 — Autonomous Pentesting Agent
 
-- :white_check_mark: **Autonomous pentesting agent** — An LLM-powered agent that plans, executes, and adapts attack campaigns with minimal human intervention
-- :white_check_mark: **Attack chain reasoning** — The agent reasons about discovered vulnerabilities to chain multi-step exploits
-- :white_check_mark: **Interactive red-team mode** — Collaborate with the pentesting agent in a conversational interface
-- :white_check_mark: **Finding deduplication** — Intelligent merging of related findings across automated and agent-driven scans
+- :white_check_mark: LangGraph-based pentesting agent (planner, executor, reasoner, reporter)
+- :white_check_mark: Attack-chain reasoning across multi-step exploits
+- :white_check_mark: Interactive red-team mode
+- :white_check_mark: Finding deduplication across automated and agent-driven scans
 
 ### v0.7 — Browser Scanning
 
-- :white_check_mark: **Browser-based agent scanning** — Headless Playwright adapter for testing agents exposed via web chat UIs
-- :white_check_mark: **Network interception** — Primary extraction via intercepted API calls (WebSocket, SSE, HTTP)
-- :white_check_mark: **DOM fallback** — Secondary extraction from rendered page content when network interception is unavailable
+- :white_check_mark: Headless Playwright adapter for agents behind web chat UIs
+- :white_check_mark: Network interception + DOM-fallback extraction
 
 ### v0.8 — Depth & Ecosystem
 
-- :white_check_mark: **Expanded tool chain patterns** — Grew from 32 to 102 dangerous patterns across 15 categories (cloud services, MCP, A2A, CI/CD, browser, crypto, and more) via YAML registry with custom pattern support
-- :white_check_mark: **Encoding/obfuscation engine** — 8 encoding types (Base64, ROT13, leetspeak, homoglyph, hex, whitespace, mixed case, payload split) with composable pipelines via `--encoding` flag
-- :white_check_mark: **Multi-turn jailbreak tactics** — Crescendo, context buildup, persona shift, and distraction tactics for progressive escalation within campaign phases
-- :white_check_mark: **BOLA/BFLA authorization testing** — Authorization bypass detector and 20 attack vectors for Broken Object/Function Level Authorization testing
-- :white_check_mark: **Promptfoo provider bridge** — Use ZIRAN as a custom Python provider for Promptfoo, enabling configuration-driven security testing with YAML test cases
-- :white_check_mark: **OpenTelemetry tracing** — Opt-in distributed tracing for campaigns, phases, attacks, and detection with zero overhead when disabled
+- :white_check_mark: Expanded tool chain patterns — grew from 32 to 102 dangerous patterns across 15 categories (cloud services, MCP, A2A, CI/CD, browser, crypto, and more)
+- :white_check_mark: Encoding / obfuscation engine — 12 encoding types (Base64, ROT13, leetspeak, homoglyph, hex, whitespace, mixed case, payload split, pig latin, reverse, word shuffle, token boundary)
+- :white_check_mark: Multi-turn jailbreak tactics — crescendo, context buildup, persona shift, distraction tactics for progressive escalation
+- :white_check_mark: BOLA / BFLA authorization testing — 20 attack vectors for Broken Object / Function Level Authorization
+- :white_check_mark: Promptfoo provider bridge — use ZIRAN as a custom Python provider in Promptfoo YAML test cases
+- :white_check_mark: OpenTelemetry tracing — opt-in distributed tracing for campaigns, phases, attacks, and detection
 
-## v0.9 — Remediation Engine
+### v0.9 — Business Impact & Resilience Metrics
 
-- [ ] **Auto-generated fix suggestions** — Concrete code patches and guardrail configurations for discovered vulnerabilities
-- [ ] **Guardrail templates** — Pre-built guardrail configurations for common agent frameworks
-- [ ] **Remediation validation** — Re-scan after applying fixes to verify remediation effectiveness
-- [ ] **Security policy generator** — Generate policy files from scan results
+- :white_check_mark: **Business impact categorisation** — findings tagged with 7 categories (financial loss, reputation damage, privacy violation, unauthorised actions, system compromise, misinformation, property loss)
+- :white_check_mark: **AILuminate-style resilience gap metric** — baseline vs under-attack performance delta
+- :white_check_mark: **Utility-under-attack measurement** — legitimate-task performance degradation during campaigns
+- :white_check_mark: Closed three critical benchmark gaps surfaced by early external review
 
-## v0.10 — MCP Server Mode
+### v0.10 — Benchmark Breadth
 
-- [ ] **ZIRAN as an MCP server** — Expose scanning capabilities via the Model Context Protocol, enabling any MCP-compatible client to trigger scans
-- [ ] **Tool-based scanning interface** — Scan agents, browse results, and manage campaigns through MCP tool calls
-- [ ] **Integration with AI IDEs** — Use ZIRAN directly from Cursor, Windsurf, Claude Desktop, and other MCP clients
-- [ ] **Continuous monitoring** — Long-running MCP server mode for periodic security assessments
+- :white_check_mark: **100% ALERT benchmark coverage** (32 micro categories)
+- :white_check_mark: **100% JailbreakBench coverage** (all 10 JBB categories)
+- :white_check_mark: **R-Judge risk scenario coverage** (10 risk types)
+- :white_check_mark: **Harmful multi-step task scenarios** — AgentHarm-aligned
+- :white_check_mark: **OWASP LLM04 (Model DoS)** — dedicated attack vectors
+- :white_check_mark: Expanded jailbreak tactic library + benchmark coverage comparison report generator
 
-## Future
+### v0.11 — Detection Accuracy & Quality Metrics
 
-- [ ] **Custom chain rule language** — User-defined tool chain patterns complementing ZIRAN's auto-discovery
-- [ ] **Community chain patterns** — Crowdsourced dangerous tool chain submissions (like Skill CVEs but for tool compositions)
-- [ ] **AgentSecBench** — Purpose-built benchmark: vulnerable agents with known tool chain vulnerabilities, demonstrating what ZIRAN catches that other tools miss
-- [ ] **Tool chain methodology paper** — Publish the discovery-based approach as research
-- [ ] **Community CVE portal** — Web-based CVE submission and search
-- [ ] **Agent benchmarking** — Comparative security scoring across agent versions
-- [ ] **Compliance reports** — SOC 2, ISO 27001, and NIST AI RMF report templates
+- :white_check_mark: **Precision / recall / F1** metrics for detection accuracy on labelled datasets
+- :white_check_mark: **StrongREJECT-style quality-aware jailbreak scoring** (refusal + specificity + convincingness composite)
+- :white_check_mark: **MCPTox tool-poisoning coverage** expanded to 100+ vectors
+- :white_check_mark: **AgentHarm multi-step vector coverage** expanded to 161 vectors
+- :white_check_mark: Historical benchmark tracking + trend analysis
+- :white_check_mark: Comparative analysis against Promptfoo, Garak, and other tools
+
+### v0.12 — Performance & Reliability Hardening
+
+- :white_check_mark: **Test suite 4.7× speedup** (7 min → 1.5 min)
+- :white_check_mark: **HTTP 429 rate-limit handling** with Retry-After header support
+- :white_check_mark: **Memory-bounded campaigns** — attack-result growth capped
+- :white_check_mark: **Combined refusal patterns into a single mega-regex** (significant detector speedup)
+- :white_check_mark: **Cached betweenness centrality** in chain analyzer
+- :white_check_mark: **Parallelised protocol auto-detection** and multi-agent scans
+- :white_check_mark: **Campaign checkpoint / resume** for long-running scans
+- :white_check_mark: **Circuit breaker pattern** for failing remote agents
+- :white_check_mark: **CLI `--dry-run` + `validate` command** for configuration sanity checks
+
+### v0.13 — Web UI Foundation
+
+- :white_check_mark: **Web UI** — React + Vite frontend, FastAPI + SQLAlchemy backend, PostgreSQL
+- :white_check_mark: **Findings management** — filtering, triage, OWASP compliance view
+- :white_check_mark: **Attack library browser** — filter by category, severity, OWASP, tags
+- :white_check_mark: **Knowledge graph visualisation** — interactive vis-network rendering
+- :white_check_mark: **Settings page** — agent configuration + scan preferences
+- :white_check_mark: **TaoQ design system** — shadcn/ui + Tailwind, dark-mode-ready
+- :white_check_mark: **Docker multi-stage build** + Playwright E2E tests
+
+### v0.14 — Runtime Bridge
+
+- :white_check_mark: **Policy export** — OPA/Rego, Cedar, NeMo Colang, Invariant Labs DSL bundles
+- :white_check_mark: **Trace analysis** — ingest OTel / Langfuse production traces, match against dangerous chains
+- :white_check_mark: **MCP registry watcher** — poll manifests, detect drift, flag typosquats
+- :white_check_mark: **CI/CD templates** for GitHub, GitLab, Jenkins, CircleCI, Azure Pipelines
+- :white_check_mark: **Agent Security Landscape** concept page — where ZIRAN fits in the pre-deploy / runtime / observability stack
+
+### v0.15 — Benchmark Maturity
+
+- :white_check_mark: **100% OWASP LLM Top 10 coverage** (10/10 categories, all strong+)
+- :white_check_mark: **MITRE ATLAS mapping** on every vector (72/86 techniques, 14/14 agent-specific)
+- :white_check_mark: **Defence profile schema + evasion-rate metric** (schema + metric field; evaluator adapters follow in the next cycle)
+- :white_check_mark: **RAG-poisoning attack category** — retrieval-aware indirect injection vectors
+- :white_check_mark: **Benchmark expansion** — TensorTrust, WildJailbreak, ToolEmu, CyberSecEval coverage lifts
+
+See the [benchmark coverage comparison](../reference/benchmarks/coverage-comparison.md) for the full dashboard.
+
+---
+
+## In Flight & Next Up
+
+Work is organised into **themes**, each tracked by an open GitHub milestone. The themes are the stable commitment; which release tag they end up shipping under is whatever `release-please` decides when the work lands — that's intentionally not pinned here because priorities shift.
+
+### Theme: Runtime Loop
+
+Close the **pre-deploy → runtime → observability** loop that v0.8 sketched. Today the runtime-bridge commands (`export-policy`, `analyze-traces`, `watch-registry`) ship infrastructure but leave the integration endpoints to humans. This theme wires them through to real systems.
+
+- [ ] **NeMo Guardrails evaluator adapter** — makes `evasion_rate` computable for the first concrete guardrail; unblocks Lakera and Invariant follow-ups ([#271](https://github.com/taoq-ai/ziran/issues/271))
+- [ ] **Registry-watcher alerting** — Slack + GitHub issue output adapters when MCP drift is detected ([#272](https://github.com/taoq-ai/ziran/issues/272))
+- [ ] **Policy auto-refresh GitHub Action** — PR-based refresh of exported policies when the library or target config changes ([#273](https://github.com/taoq-ai/ziran/issues/273))
+- [ ] **Trace-analysis → GitHub issues** — auto-file issues when production traces match dangerous chains ([#274](https://github.com/taoq-ai/ziran/issues/274))
+
+### Theme: Detection Depth
+
+Close frontier attack gaps (gradient-based attacks, many-shot jailbreaks, tool-schema confusion) and detection-quality gaps (multilingual refusal, untuned thresholds, no precision/recall baseline). Benchmark what ZIRAN claims against labelled ground truth.
+
+- [ ] **Gradient-based adversarial attacks (GCG / PAIR)** — new `AdvancedAttackGenerator` subsystem for optimiser-based attacks ([#275](https://github.com/taoq-ai/ziran/issues/275))
+- [ ] **Many-shot jailbreaking category** — exploits long-context windows with hundreds of shots ([#276](https://github.com/taoq-ai/ziran/issues/276))
+- [ ] **Tool-schema confusion category** — malformed schemas, parameter type confusion, enum injection ([#277](https://github.com/taoq-ai/ziran/issues/277))
+- [ ] **Multilingual refusal detection** — extend the refusal detector beyond English (Chinese, Spanish, German, French, Japanese) ([#278](https://github.com/taoq-ai/ziran/issues/278))
+- [ ] **Precision/recall/F1 benchmark per detector** — labelled ground-truth eval, threshold tuning methodology ([#279](https://github.com/taoq-ai/ziran/issues/279))
+- [ ] **Pentesting-agent ground-truth evaluation** — does the autonomous agent find vulnerabilities the rule-based scanner misses? ([#280](https://github.com/taoq-ai/ziran/issues/280))
+
+### Theme: Production Scale
+
+Harden the runtime for enterprise production use — rate-limiting, structured logging, resumable checkpoints, proper metrics.
+
+- [ ] **Rate-limiting + retry with backoff** — per-provider token bucket, exponential retry on 429s, scale beyond the current 5-concurrent default ([#281](https://github.com/taoq-ai/ziran/issues/281))
+- [ ] **Structured JSON logging (structlog)** — machine-queryable audit trail for ELK / Datadog / Splunk ingestion ([#282](https://github.com/taoq-ai/ziran/issues/282))
+- [ ] **Partial-phase checkpoint resume** — save progress within a phase; don't lose 30 min of work on a crash ([#283](https://github.com/taoq-ai/ziran/issues/283))
+- [ ] **OTel metrics export (Prometheus-compatible)** — counters, gauges, histograms beyond the existing span export ([#284](https://github.com/taoq-ai/ziran/issues/284))
+
+### Theme: Ecosystem + Enterprise
+
+Expand framework reach and unlock enterprise-facing positioning: incremental scanning for dev-loop speed, compliance evidence bundles for procurement.
+
+- [ ] **AutoGen adapter** — Microsoft's multi-agent framework ([#285](https://github.com/taoq-ai/ziran/issues/285))
+- [ ] **Anthropic SDK native adapter** — direct path, no LangChain wrapping ([#286](https://github.com/taoq-ai/ziran/issues/286))
+- [ ] **Langfuse API trace ingestor** — live pulls, not file exports ([#287](https://github.com/taoq-ai/ziran/issues/287))
+- [ ] **Incremental / diff scanning** — only re-test changed vectors; unlock pre-commit-hook and fast-CI-gate use ([#288](https://github.com/taoq-ai/ziran/issues/288))
+- [ ] **Compliance evidence bundles** — EU AI Act / NIST AI RMF / ISO 42001 mapping + export ([#289](https://github.com/taoq-ai/ziran/issues/289))
+
+### Opportunistic — Not in a theme
+
+These don't block a milestone but are worth landing when someone has a slot:
+
+- [ ] **Attack library community submission workflow** — clear contributor path, PR template, CI schema linter ([#290](https://github.com/taoq-ai/ziran/issues/290)) — `good first issue`
+- [ ] **Supply-chain signing** — cosign signatures on releases, CycloneDX SBOM, SLSA provenance ([#291](https://github.com/taoq-ai/ziran/issues/291))
+- [ ] **`ziran init` scaffolding command** — one-liner onboarding ([#292](https://github.com/taoq-ai/ziran/issues/292)) — `good first issue`
+- [ ] **Expand ATLAS coverage to remaining tactics** — AI Model Access, AI Attack Staging ([#264](https://github.com/taoq-ai/ziran/issues/264))
+- [ ] **asqav signing integration sketch** — downstream signing of ZIRAN outputs ([#259](https://github.com/taoq-ai/ziran/issues/259))
+- [ ] **HTML report graph pagination** — perf improvement for large campaigns ([#217](https://github.com/taoq-ai/ziran/issues/217))
+
+### UI Hardening
+
+Tracked as a parallel stream. See [UI-labelled issues](https://github.com/taoq-ai/ziran/labels/ui).
+
+---
+
+## Longer Term
+
+Directions we're watching but not yet committed to a milestone on. These are the places where the shape of the work isn't settled yet — what ships depends on signal from users and on what the surrounding ecosystem does.
+
+- **Multimodal prompt injection** — image / document / audio attack surface, once multimodal agents are common production targets
+- **Custom chain rule language** — user-defined tool chain patterns complementing auto-discovery
+- **AgentSecBench** — purpose-built benchmark of deliberately-vulnerable agents with known tool-chain vulnerabilities; demonstrates what ZIRAN catches that other tools miss
+- **Tool chain methodology paper** — publish the discovery-based approach as research
+- **Red-team / blue-team split mode** — meaningful once the DefenceProfile evaluator ecosystem has multiple implementations (waits for #271 and the next evaluator)
+- **Federated agent trust boundary modelling** — cross-org / cross-network agent topologies
+
+---
+
+## ZIRAN Cloud
+
+A hosted platform layer is planned for commercial / enterprise use cases. OSS ZIRAN remains the foundation — Cloud builds on top rather than replacing anything. Current direction is tracked privately but the capabilities under consideration include:
+
+- **Managed parallel scanning** — campaigns fan out across worker pools with global rate-limiting; no self-hosted Ray/Celery required
+- **Curated premium threat-intel feed** — continuously updated vector library with researcher provenance, SLA-backed, complementing the open community-submission path
+- **Multi-tenant RBAC** — red-team / blue-team role dashboards, audit logs, team-based compliance workflows
+
+These are deliberately not in the OSS roadmap because they either require hosted infrastructure to be useful or would conflict with the partner ecosystem (NeMo, Lakera, Invariant, Langfuse) that OSS ZIRAN works **with**, not against.
+
+---
 
 ## How to Influence the Roadmap
 
-- **Vote on issues** — :thumbsup: issues that matter to you
-- **Open feature requests** — [Feature request template](https://github.com/taoq-ai/ziran/issues/new?template=feature_request.md)
-- **Contribute code** — PRs for roadmap items are very welcome
+- **Vote on issues** — :thumbsup: issues that matter to you; we read the vote counts when prioritising
+- **Open feature requests** — [feature request template](https://github.com/taoq-ai/ziran/issues/new?template=feature_request.md)
+- **Contribute code** — PRs for any of the themed issues above are very welcome; look for `good first issue` labels
 - **Share feedback** — [Discussions](https://github.com/taoq-ai/ziran/discussions)

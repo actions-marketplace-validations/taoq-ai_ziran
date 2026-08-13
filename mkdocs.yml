@@ -66,11 +66,13 @@ nav:
     - Pentesting Agent: concepts/pentesting-agent.md
     - Streaming: concepts/streaming.md
     - Browser Scanning: concepts/browser-scanning.md
+    - Agent Security Landscape: concepts/agent-security-landscape.md
   - Guides:
     - Scanning Agents: guides/scanning-agents.md
     - Remote Agents: guides/remote-agents.md
     - Browser Agents: guides/browser-agents.md
     - CI/CD Integration: guides/cicd-integration.md
+    - CI Integrations: guides/ci-integrations.md
     - Promptfoo Integration: guides/promptfoo-integration.md
     - OpenTelemetry Tracing: guides/otel-tracing.md
     - Static Analysis: guides/static-analysis.md
@@ -81,6 +83,9 @@ nav:
     - CLI Reference: reference/cli.md
     - Python API: reference/api.md
     - Attack Library: reference/attack-library.md
+    - Benchmarks:
+      - Coverage Comparison: reference/benchmarks/coverage-comparison.md
+      - MITRE ATLAS Mapping: reference/benchmarks/atlas-mapping.md
   - Community:
     - Contributing: community/contributing.md
     - Skill CVEs: community/skill-cves.md
