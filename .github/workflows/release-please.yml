@@ -16,7 +16,7 @@ jobs:
     outputs:
       is-release-merge: ${{ steps.check.outputs.is-release-merge }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 50
       - name: Check if merge is from release or hotfix branch
